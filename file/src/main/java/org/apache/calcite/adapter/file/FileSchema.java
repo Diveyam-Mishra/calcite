@@ -144,8 +144,8 @@ class FileSchema extends AbstractSchema {
     }
     final Source sourceSansCsv = sourceSansGz.trimOrNull(".csv");
     if (sourceSansCsv != null) {
-      final Table table = new CsvTranslatableTable(source, null,
-          CSVParser.DEFAULT_SEPARATOR);
+      final Table table =
+          new CsvTranslatableTable(source, null, CSVParser.DEFAULT_SEPARATOR);
       builder.put(Util.first(tableName, sourceSansCsv.path()), table);
       return true;
     }
