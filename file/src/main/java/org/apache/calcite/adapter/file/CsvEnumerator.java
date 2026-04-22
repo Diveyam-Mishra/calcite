@@ -27,7 +27,6 @@ import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.Source;
 import org.apache.calcite.util.trace.CalciteLogger;
 
-import au.com.bytecode.opencsv.CSVParser;
 import au.com.bytecode.opencsv.CSVReader;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -114,10 +113,20 @@ public class CsvEnumerator<E> implements Enumerator<E> {
       .compile("\"decimal\\(([0-9]+),([0-9]+)\\)");
 
   public CsvEnumerator(Source source, AtomicBoolean cancelFlag,
+      List<RelDataType> fieldTypes, List<Integer> fields) {
+    this(source, cancelFlag, fieldTypes, fields, ',');
+  }
+
+  public CsvEnumerator(Source source, AtomicBoolean cancelFlag,
       List<RelDataType> fieldTypes, List<Integer> fields, char separator) {
     //noinspection unchecked
     this(source, cancelFlag, false, null,
         (RowConverter<E>) converter(fieldTypes, fields), separator);
+  }
+
+  public CsvEnumerator(Source source, AtomicBoolean cancelFlag, boolean stream,
+      @Nullable String @Nullable [] filterValues, RowConverter<E> rowConverter) {
+    this(source, cancelFlag, stream, filterValues, rowConverter, ',');
   }
 
   public CsvEnumerator(Source source, AtomicBoolean cancelFlag, boolean stream,
@@ -153,6 +162,13 @@ public class CsvEnumerator<E> implements Enumerator<E> {
   public static RowConverter<@Nullable Object[]> arrayConverter(
       List<RelDataType> fieldTypes, List<Integer> fields, boolean stream) {
     return new ArrayRowConverter(fieldTypes, fields, stream);
+  }
+
+  /** Deduces the names and types of a table's columns by reading the first line
+   * of a CSV file. */
+  public static RelDataType deduceRowType(JavaTypeFactory typeFactory,
+      Source source, @Nullable List<RelDataType> fieldTypes, Boolean stream) {
+    return deduceRowType(typeFactory, source, fieldTypes, stream, ',');
   }
 
   /** Deduces the names and types of a table's columns by reading the first line
