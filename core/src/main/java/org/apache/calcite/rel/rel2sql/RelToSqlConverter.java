@@ -59,6 +59,7 @@ import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexLocalRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexProgram;
+import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.JoinConditionType;
 import org.apache.calcite.sql.JoinType;
 import org.apache.calcite.sql.SqlAsofJoin;
@@ -546,17 +547,38 @@ public class RelToSqlConverter extends SqlImplementor
             null);
     return result(join, leftResult, rightResult);
   }
-
   /** Visits a Filter; called by {@link #dispatch} via reflection. */
   public Result visit(Filter e) {
     final RelNode input = e.getInput();
+    final Set<CorrelationId> definedHere = e.getVariablesSet();
+
     if (input instanceof Aggregate) {
       final Aggregate aggregate = (Aggregate) input;
       final boolean ignoreClauses = aggregate.getInput() instanceof Project;
-      final Result x =
+      Result x =
           visitInput(e, 0, isAnon(), ignoreClauses,
               ImmutableSet.of(Clause.HAVING));
+      // Only rebind the correlation alias when e.getInput() renders as a single
+      // addressable relation (<=1 input): TableScan, Project, Filter, etc.
+      // Join/Correlate (2+ inputs) already expose a multi-alias context via
+      // joinContext(); collapsing it here would break field resolution.
+      final boolean pushed = !definedHere.isEmpty()
+          && e.getInput().getInputs().size() <= 1;
+      if (pushed) {
+        String alias = x.neededAlias;
+        if (alias != null) {
+          x = x.resetAliasForCorrelation(alias, e.getInput().getRowType());
+        } else {
+          alias = unqualifiedName(x.node);
+          if (alias == null) {
+            alias = "t";
+          }
+          x = x.resetAliasForCorrelation
+              (alias, e.getInput().getRowType());
+        }
+      }
       parseCorrelTable(e, x);
+
       final Builder builder = x.builder(e);
       x.asSelect().setHaving(
           SqlUtil.andExpressions(x.asSelect().getHaving(),
@@ -564,8 +586,24 @@ public class RelToSqlConverter extends SqlImplementor
       return builder.result();
     } else {
       Result x = visitInput(e, 0, Clause.WHERE);
-      if (!e.getVariablesSet().isEmpty()) {
-        x = x.resetAlias();
+      // Only rebind the correlation alias when e.getInput() renders as a single
+      // addressable relation (<=1 input): TableScan, Project, Filter, etc.
+      // Join/Correlate (2+ inputs) already expose a multi-alias context via
+      // joinContext(); collapsing it here would break field resolution.
+      final boolean pushed = !definedHere.isEmpty()
+          && e.getInput().getInputs().size() <= 1;
+      if (pushed) {
+        String alias = x.neededAlias;
+        if (alias != null) {
+          x = x.resetAliasForCorrelation(alias, e.getInput().getRowType());
+        } else {
+          alias = unqualifiedName(x.node);
+          if (alias == null) {
+            alias = "t";
+          }
+          x = x.resetAliasForCorrelation
+              (alias, e.getInput().getRowType());
+        }
       }
       parseCorrelTable(e, x);
       final Builder builder = x.builder(e);
@@ -573,7 +611,6 @@ public class RelToSqlConverter extends SqlImplementor
         final Context context = x.qualifiedContext();
         if (selectListRequired(context)) {
           final ImmutableList.Builder<SqlNode> selectList = ImmutableList.builder();
-          // Fieldnames are unique since they are created by SqlValidatorUtil.deriveJoinRowType()
           final List<String> uniqueFieldNames = input.getRowType().getFieldNames();
           for (int i = 0; i < context.fieldCount; i++) {
             final SqlNode field = context.field(i);
@@ -1191,7 +1228,7 @@ public class RelToSqlConverter extends SqlImplementor
           sqlSelect.setOffset(offset);
         }
         if (e.fetch != null) {
-          SqlNode fetch = builder.context.toSql(null, e.fetch);
+          SqlNode fetch = toSqlFetch(e, builder.context);
           sqlSelect.setFetch(fetch);
         }
         return result(sqlSelect, ImmutableList.of(Clause.ORDER_BY), e, null);
@@ -1249,11 +1286,18 @@ public class RelToSqlConverter extends SqlImplementor
    * The builder must have been created with OFFSET and FETCH clauses. */
   void offsetFetch(Sort e, Builder builder) {
     if (e.fetch != null) {
-      builder.setFetch(builder.context.toSql(null, e.fetch));
+      builder.setFetch(toSqlFetch(e, builder.context));
     }
     if (e.offset != null) {
       builder.setOffset(builder.context.toSql(null, e.offset));
     }
+  }
+
+  private static SqlNode toSqlFetch(Sort sort, Context context) {
+    final RexNode fetch = requireNonNull(sort.fetch, "fetch");
+    final @Nullable RexLiteral reduced =
+        RexUtil.reduceFetchToLiteral(sort.getCluster(), fetch);
+    return context.toSql(null, reduced == null ? fetch : reduced);
   }
 
   public boolean hasTrickyRollup(Sort e, Aggregate aggregate) {
@@ -1574,16 +1618,6 @@ public class RelToSqlConverter extends SqlImplementor
       result.add(new SqlIdentifier(fieldName, POS));
     });
     return result;
-  }
-
-  @Override public void addSelect(List<SqlNode> selectList, SqlNode node,
-      RelDataType rowType) {
-    String name = rowType.getFieldNames().get(selectList.size());
-    @Nullable String alias = SqlValidatorUtil.alias(node);
-    if (alias == null || !alias.equals(name)) {
-      node = as(node, name);
-    }
-    selectList.add(node);
   }
 
   private void parseCorrelTable(RelNode relNode, Result x) {

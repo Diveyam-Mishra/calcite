@@ -87,6 +87,7 @@ import org.apache.calcite.rel.rules.JoinCommuteRule;
 import org.apache.calcite.rel.rules.LoptOptimizeJoinRule;
 import org.apache.calcite.rel.rules.MeasureRules;
 import org.apache.calcite.rel.rules.MultiJoin;
+import org.apache.calcite.rel.rules.MultiJoinOptimizeBushyRule;
 import org.apache.calcite.rel.rules.ProjectCorrelateTransposeRule;
 import org.apache.calcite.rel.rules.ProjectFilterTransposeRule;
 import org.apache.calcite.rel.rules.ProjectJoinTransposeRule;
@@ -1497,6 +1498,26 @@ class RelOptRulesTest extends RelOptTestBase {
     checkSemiOrAntiJoinProjectTranspose(JoinRelType.ANTI);
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7623">[CALCITE-7623]
+   * SemiJoinProjectTransposeRule should support ANTI joins</a>. */
+  @Test void testSemiJoinProjectTransposeSupportsAntiJoin() {
+    final Function<RelBuilder, RelNode> relFn = b -> {
+      RelNode left = b.scan("DEPT")
+          .project(b.field("DNAME"), b.field("DEPTNO"))
+          .build();
+      RelNode right = b.scan("EMP").build();
+
+      return b.push(left)
+          .push(right)
+          .join(JoinRelType.ANTI,
+              b.equals(b.field(2, 0, "DEPTNO"),
+                  b.field(2, 1, "DEPTNO")))
+          .build();
+    };
+    relFn(relFn).withRule(CoreRules.SEMI_JOIN_PROJECT_TRANSPOSE).check();
+  }
+
   private void checkSemiOrAntiJoinProjectTranspose(JoinRelType type) {
     final Function<RelBuilder, RelNode> relFn = b -> {
       RelNode left = b.scan("DEPT").build();
@@ -1515,6 +1536,43 @@ class RelOptRulesTest extends RelOptTestBase {
           .build();
     };
     relFn(relFn).withRule(CoreRules.PROJECT_JOIN_TRANSPOSE).check();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7622">[CALCITE-7622]
+   * Don't fire JoinProjectTransposeRule for ANTI/SEMI/LEFT_MARK JOIN</a>. */
+  @Test void testJoinProjectTransposeDoesNotMatchSemiJoin() {
+    checkJoinProjectTransposeDoesNotMatch(JoinRelType.SEMI);
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7622">[CALCITE-7622]
+   * Don't fire JoinProjectTransposeRule for ANTI/SEMI/LEFT_MARK JOIN</a>. */
+  @Test void testJoinProjectTransposeDoesNotMatchAntiJoin() {
+    checkJoinProjectTransposeDoesNotMatch(JoinRelType.ANTI);
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7622">[CALCITE-7622]
+   * Don't fire JoinProjectTransposeRule for ANTI/SEMI/LEFT_MARK JOIN</a>. */
+  @Test void testJoinProjectTransposeDoesNotMatchLeftMarkJoin() {
+    checkJoinProjectTransposeDoesNotMatch(JoinRelType.LEFT_MARK);
+  }
+
+  /** A SEMI, ANTI or LEFT_MARK join does not project its right input, so
+   * {@link JoinProjectTransposeRule} must not pull projects above it. */
+  private void checkJoinProjectTransposeDoesNotMatch(JoinRelType type) {
+    final Function<RelBuilder, RelNode> relFn = b -> b
+        .scan("EMP")
+        .project(b.field("DEPTNO"))
+        .scan("DEPT")
+        .project(b.field("DEPTNO"))
+        .join(type,
+            b.equals(
+                b.field(2, 0, 0),
+                b.field(2, 1, 0)))
+        .build();
+    relFn(relFn).withRule(CoreRules.JOIN_PROJECT_BOTH_TRANSPOSE).checkUnchanged();
   }
 
   @Test void testJoinProjectTranspose1() {
@@ -1677,6 +1735,34 @@ class RelOptRulesTest extends RelOptTestBase {
     sql(sql)
         .withRule(CoreRules.PROJECT_SET_OP_TRANSPOSE,
             CoreRules.SORT_UNION_TRANSPOSE_MATCH_NULL_FETCH)
+        .check();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testSortUnionTransposeWithNonDeterministicFetch() {
+    final String sql = "select a.name from dept a\n"
+        + "union all\n"
+        + "select b.name from dept b\n"
+        + "order by name fetch next (rand_integer(10)) rows only";
+    sql(sql)
+        .withPreRule(CoreRules.PROJECT_SET_OP_TRANSPOSE)
+        .withRule(CoreRules.SORT_UNION_TRANSPOSE)
+        .checkUnchanged();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testSortUnionTransposePushesParameterizedFetchExpression() {
+    final String sql = "select a.name from dept a\n"
+        + "union all\n"
+        + "select b.name from dept b\n"
+        + "order by name fetch next (? + 1) rows only";
+    sql(sql)
+        .withPreRule(CoreRules.PROJECT_SET_OP_TRANSPOSE)
+        .withRule(CoreRules.SORT_UNION_TRANSPOSE)
         .check();
   }
 
@@ -2326,6 +2412,29 @@ class RelOptRulesTest extends RelOptTestBase {
     sql(sql)
         .withRule(CoreRules.FILTER_REDUCE_EXPRESSIONS)
         .check();
+  }
+
+  /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7619">[CALCITE-7619]
+   * RexSimplify incorrectly simplifies IS_FALSE(x) when x is nullable</a>. */
+  @Test void testExpressionSimplification3() {
+    final String sql = "WITH tmp(bool_col) AS (\n"
+        + "    VALUES (TRUE),\n"
+        + "           (FALSE),\n"
+        + "           (NULL)\n"
+        + ")\n"
+        + "SELECT *\n"
+        + "FROM tmp\n"
+        + "WHERE bool_col IS FALSE";
+    // Simplify actually hides the bug we are trying to solve, so we disable it.
+    // Without this fix the reduce rule will fail with an assertion failure
+    // becase it tries to create a filter with a cast that strips nullability.
+    RelBuilder.Config config = RelBuilder.Config.DEFAULT.withSimplify(false);
+    RelOptRule reduce =
+        ReduceExpressionsRule.FilterReduceExpressionsRule.FilterReduceExpressionsRuleConfig.DEFAULT
+        .withRelBuilderFactory(RelBuilder.proto(config)).toRule();
+    sql(sql)
+        .withRule(reduce)
+        .checkUnchanged();
   }
 
   @Test void testReduceAverage() {
@@ -5900,10 +6009,9 @@ class RelOptRulesTest extends RelOptTestBase {
   }
 
   /** Test case for
-   * <a href="https://issues.apache.org/jira/browse/CALCITE-6647">[CALCITE-6647]
-   * SortUnionTransposeRule should not push SORT past a UNION when SORT's fetch is DynamicParam
-   </a>. */
-  @Test void testSortWithDynamicParam() {
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testSortWithDynamicParamPushesOnce() {
     HepProgramBuilder builder = new HepProgramBuilder();
     builder.addRuleClass(SortProjectTransposeRule.class);
     builder.addRuleClass(SortUnionTransposeRule.class);
@@ -5972,7 +6080,7 @@ class RelOptRulesTest extends RelOptTestBase {
   @Test void testReduceCastsNullable() {
     HepProgram program = new HepProgramBuilder()
 
-        // Simulate the way INSERT will insert casts to the target types
+        // Simulate the way INSERT can insert casts to the target types.
         .addRuleInstance(
             CoerceInputsRule.Config.DEFAULT
                 .withCoerceNames(false)
@@ -8560,6 +8668,22 @@ class RelOptRulesTest extends RelOptTestBase {
         .check();
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7645">[CALCITE-7645]
+   * AggregateUnionTransposeRule drops aggregate FILTER when rebuilding
+   * pushed-down aggregate calls</a>. */
+  @Test void testAggregateUnionTransposeWithFilterAndNullableInput() {
+    final String sql = "select min(v) filter (where p)\n"
+        + "from (\n"
+        + "  select * from (values (10, false), (100, true)) as t(v, p)\n"
+        + "  union all\n"
+        + "  select * from (values (cast(null as integer), true), (200, true)) as t(v, p)\n"
+        + ")";
+    sql(sql)
+        .withRule(CoreRules.AGGREGATE_UNION_TRANSPOSE)
+        .check();
+  }
+
   /** If all inputs to UNION are already unique, AggregateUnionTransposeRule is
    * a no-op. */
   @Test void testAggregateUnionTransposeWithAllInputsUnique() {
@@ -9617,6 +9741,19 @@ class RelOptRulesTest extends RelOptTestBase {
         .check();
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testDecorrelateProjectWithFetchExpression() {
+    final String query = "SELECT name, "
+        + "(SELECT sal FROM emp where dept.deptno = emp.deptno order by sal "
+        + "fetch next (1 + 0) rows only) "
+        + "FROM dept";
+    sql(query).withRule(CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE)
+        .withLateDecorrelate(true)
+        .check();
+  }
+
   /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7289">[CALCITE-7289]
    * Select NULL subquery throwing exception</a>. */
   @Test void testNullSelect() {
@@ -9923,6 +10060,19 @@ class RelOptRulesTest extends RelOptTestBase {
         + "or\n"
         + "t1.mgr between 10.0 and 20\n";
 
+    sql(sql).withRule(CoreRules.JOIN_EXPAND_OR_TO_UNION_RULE)
+        .check();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7634">[CALCITE-7634]
+   * JoinExpandOrToUnionRule incorrectly expands OR branches with non-equi
+   * predicates referencing both join inputs</a>. */
+  @Test void testJoinConditionOrExpansionRuleWithCrossInputPredicate() {
+    String sql = "select * from EMP as p1\n"
+        + "inner join EMP as p2 on (p1.empno = p2.empno and p1.sal < p2.sal)\n"
+        + "or (p1.mgr = p2.mgr and p1.comm < p2.comm)\n"
+        + "or p1.deptno = p2.deptno";
     sql(sql).withRule(CoreRules.JOIN_EXPAND_OR_TO_UNION_RULE)
         .check();
   }
@@ -11345,6 +11495,19 @@ class RelOptRulesTest extends RelOptTestBase {
   }
 
   /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7638">[CALCITE-7638]
+   * SetOpToFilterRule MINUS drops rows when right-side filters evaluate to UNKNOWN</a>. */
+  @Test void testMinusToFilterRuleWithNullableFilter() {
+    final String sql = "SELECT mgr, comm FROM empnullables WHERE mgr = 12\n"
+        + "EXCEPT\n"
+        + "SELECT mgr, comm FROM empnullables WHERE comm = 5\n";
+    sql(sql)
+        .withPreRule(CoreRules.PROJECT_FILTER_TRANSPOSE)
+        .withRule(CoreRules.MINUS_FILTER_TO_FILTER)
+        .check();
+  }
+
+  /** Test case of
    * <a href="https://issues.apache.org/jira/browse/CALCITE-6973">[CALCITE-6973]
    * Add rule for convert Minus to Filter</a>. */
   @Test void testMinusToFilterRuleWithOneFilter() {
@@ -11573,6 +11736,19 @@ class RelOptRulesTest extends RelOptTestBase {
   @Test void testAggregateMinMaxToLimitRule() {
     final String sql = "select min(deptno), max(deptno) from emp";
     sql(sql).withRule(CoreRules.AGGREGATE_MIN_MAX_TO_LIMIT)
+        .check();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7643">[CALCITE-7643]
+   * AggregateMinMaxToLimitRule drops FILTER condition for filtered
+   * MIN/MAX aggregates</a>. */
+  @Test void testAggregateMinMaxToLimitRuleWithFilter() {
+    final String sql = "select min(v) filter (where p), max(v) filter (where p)\n"
+        + "from (values (10, false), (100, true), (200, true),\n"
+        + "    (300, false), (cast(null as integer), true)) as t(v, p)";
+    sql(sql)
+        .withRule(CoreRules.AGGREGATE_MIN_MAX_TO_LIMIT)
         .check();
   }
 
@@ -11923,6 +12099,92 @@ class RelOptRulesTest extends RelOptTestBase {
   }
 
   /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7242">[CALCITE-7242]
+   * Implement a rule to eliminate LITERAL_AGG so that other databases can handle it</a>. */
+  @Test void testAggregateRemoveLiteralAggRuleWithAnySubQuery() {
+    final String sql = "select deptno, name = ANY (\n"
+        + "  select mgr from emp)\n"
+        + "from dept";
+    sql(sql)
+        .withSubQueryRules()
+        .withLateDecorrelate(true)
+        .withAfter((fixture, rel) -> applyAggregateRemoveLiteralAggRule(rel))
+        .check();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7242">[CALCITE-7242]
+   * Implement a rule to eliminate LITERAL_AGG so that other databases can handle it</a>. */
+  @Test void testAggregateRemoveLiteralAggRuleWithInSubQuery() {
+    final String sql = "select empno\n"
+        + "from sales.emp\n"
+        + "where deptno in (select deptno from sales.emp where empno < 20)\n"
+        + "or emp.sal < 100";
+    sql(sql)
+        .withSubQueryRules()
+        .withLateDecorrelate(true)
+        .withAfter((fixture, rel) -> applyAggregateRemoveLiteralAggRule(rel))
+        .check();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7242">[CALCITE-7242]
+   * Implement a rule to eliminate LITERAL_AGG so that other databases can handle it</a>. */
+  @Test void testAggregateRemoveLiteralAggRuleWithRegularAggCall() {
+    final Function<RelBuilder, RelNode> relFn = b -> b
+        .scan("EMP")
+        .aggregate(b.groupKey("DEPTNO"),
+            b.count().as("c"),
+            b.literalAgg(true).as("i"))
+        .build();
+    relFn(relFn)
+        .withRule(CoreRules.AGGREGATE_REMOVE_LITERAL_AGG)
+        .check();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7242">[CALCITE-7242]
+   * Implement a rule to eliminate LITERAL_AGG so that other databases can handle it</a>. */
+  @Test void testAggregateRemoveLiteralAggRuleWithEmptyInput() {
+    final Function<RelBuilder, RelNode> relFn = b -> {
+      final RelBuilder builder =
+          RelBuilderTest.createBuilder(c -> c.withAggregateUnique(true));
+      return builder
+          .scan("EMP")
+          .empty()
+          .aggregate(builder.groupKey("DEPTNO"),
+              builder.literalAgg(true).as("i"))
+          .build();
+    };
+    relFn(relFn)
+        .withRule(CoreRules.AGGREGATE_REMOVE_LITERAL_AGG)
+        .check();
+  }
+
+  /** Test case of
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7242">[CALCITE-7242]
+   * Implement a rule to eliminate LITERAL_AGG so that other databases can handle it</a>. */
+  @Test void testAggregateRemoveLiteralAggRuleWithOnlyLiteralAgg() {
+    final Function<RelBuilder, RelNode> relFn = b -> b
+        .scan("EMP")
+        .aggregate(b.groupKey(),
+            b.literalAgg(true).as("i"))
+        .build();
+    relFn(relFn)
+        .withRule(CoreRules.AGGREGATE_REMOVE_LITERAL_AGG)
+        .check();
+  }
+
+  private static RelNode applyAggregateRemoveLiteralAggRule(RelNode rel) {
+    final HepProgram program = HepProgram.builder()
+        .addRuleInstance(CoreRules.AGGREGATE_REMOVE_LITERAL_AGG)
+        .build();
+    final HepPlanner hep = new HepPlanner(program);
+    hep.setRoot(rel);
+    return hep.findBestExp();
+  }
+
+  /** Test case of
    * <a href="https://issues.apache.org/jira/browse/CALCITE-7178">[CALCITE-7178]
    * FETCH and OFFSET in EnumerableMergeUnionRule do not support BIGINT</a>. */
   @Test void testEnumerableMergeUnionRule() {
@@ -11978,6 +12240,39 @@ class RelOptRulesTest extends RelOptTestBase {
         .withLateDecorrelate(true)
         .withTopDownGeneralDecorrelate(true)
         .check();
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testNondeterministicFetchPreventsDecorrelation() {
+    checkNondeterministicFetchPreventsDecorrelation(false);
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testNondeterministicFetchPreventsTopDownDecorrelation() {
+    checkNondeterministicFetchPreventsDecorrelation(true);
+  }
+
+  private void checkNondeterministicFetchPreventsDecorrelation(boolean enableTopDown) {
+    final String sql = "select t.deptno, e.ename\n"
+        + "from (select distinct deptno from emp) t,\n"
+        + "lateral (select ename from emp\n"
+        + "  where emp.deptno = t.deptno\n"
+        + "  order by sal\n"
+        + "  fetch next (rand_integer(2) + 1) rows only) e";
+
+    final RelOptFixture fixture = sql(sql)
+        .withRule() // empty program
+        .withLateDecorrelate(true)
+        .withTopDownGeneralDecorrelate(enableTopDown);
+    if (enableTopDown) {
+      fixture.check();
+    } else {
+      fixture.checkUnchanged();
+    }
   }
 
   @Test void testTopDownGeneralDecorrelateForFilterSome() {

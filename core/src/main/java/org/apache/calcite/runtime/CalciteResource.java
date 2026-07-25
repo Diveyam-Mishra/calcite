@@ -164,6 +164,15 @@ public interface CalciteResource {
   @BaseMessage("Values passed to {0} operator must have compatible types")
   ExInst<SqlValidatorException> incompatibleValueType(String a0);
 
+  @BaseMessage("FETCH expression must have a numeric type; actual type is ''{0}''")
+  ExInst<SqlValidatorException> fetchExpressionMustBeNumeric(String type);
+
+  @BaseMessage("FETCH expression cannot reference table column ''{0}''")
+  ExInst<SqlValidatorException> fetchExpressionCannotReferenceColumn(String column);
+
+  @BaseMessage("FETCH expression evaluated to NULL")
+  ExInst<SqlValidatorException> fetchExpressionEvaluatedToNull();
+
   @BaseMessage("Values in expression list must have compatible types")
   ExInst<SqlValidatorException> incompatibleTypesInList();
 
@@ -244,8 +253,14 @@ public interface CalciteResource {
   ExInst<SqlValidatorException> paramNotFoundInFunctionDidYouMean(String a0,
       String a1, String a2);
 
+  @BaseMessage("Lambda closure is not allowed in this conformance: reference to ''{0}'' from enclosing scope")
+  ExInst<SqlValidatorException> lambdaClosureNotAllowed(String identifier);
+
   @BaseMessage("Param ''{0}'' not found in lambda expression ''{1}''")
   ExInst<SqlValidatorException> paramNotFoundInLambdaExpression(String a0, String a1);
+
+  @BaseMessage("Duplicate lambda parameter ''{0}''")
+  ExInst<SqlValidatorException> duplicateLambdaParameter(String paramName);
 
   @BaseMessage("Operand {0} must be a query")
   ExInst<SqlValidatorException> needQueryOp(String a0);
@@ -741,7 +756,7 @@ public interface CalciteResource {
   @BaseMessage("Map requires an even number of arguments")
   ExInst<SqlValidatorException> mapRequiresEvenArgCount();
 
-  @BaseMessage("Function ''{0}'' should all be of type map, but it is ''{1}''")
+  @BaseMessage("Arguments of function ''{0}'' should all be of type MAP, but ''{1}'' was found")
   ExInst<SqlValidatorException> typesShouldAllBeMap(String funcName, String type);
 
   @BaseMessage("Incompatible types")
@@ -776,6 +791,9 @@ public interface CalciteResource {
 
   @BaseMessage("Streaming ORDER BY must start with monotonic expression")
   ExInst<SqlValidatorException> streamMustOrderByMonotonic();
+
+  @BaseMessage("ORDER BY ALL requires an explicit SELECT list; ''*'' is not supported")
+  ExInst<SqlValidatorException> orderByAllRequiresExplicitSelectList();
 
   @BaseMessage("Set operator cannot combine streaming and non-streaming inputs")
   ExInst<SqlValidatorException> streamSetOpInconsistentInputs();
@@ -920,6 +938,9 @@ public interface CalciteResource {
 
   @BaseMessage("Extended columns not allowed under the current SQL conformance level")
   ExInst<SqlValidatorException> extendNotAllowed();
+
+  @BaseMessage("Aggregate function referencing outer column is not allowed under the current SQL conformance level")
+  ExInst<SqlValidatorException> correlatedAggregateNotAllowed();
 
   @BaseMessage("Rolled up column ''{0}'' is not allowed in {1}")
   ExInst<SqlValidatorException> rolledUpNotAllowed(String column, String context);

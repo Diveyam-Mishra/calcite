@@ -93,6 +93,9 @@ public class RexSimplify {
 
   private static final Strong STRONG = new Strong();
 
+  /** Maximum number of terms for which to apply the absorption law. */
+  private static final int MAX_TERMS_FOR_ABSORPTION = 20;
+
   /**
    * Creates a RexSimplify.
    *
@@ -199,6 +202,14 @@ public class RexSimplify {
     if (!matchNullability
         && SqlTypeUtil.equalSansNullability(rexBuilder.typeFactory, e2.getType(), e.getType())) {
       return e2;
+    }
+    // If simplification widens nullability (NOT NULL → nullable) without changing
+    // the base type, using a CAST to NOT NULL is wrong: e.g.
+    // x IS FALSE is not the same as CAST(NOT(x) AS BOOLEAN NOT NULL).
+    // Return the original expression to preserve both semantics and type.
+    if (!e.getType().isNullable() && e2.getType().isNullable()
+        && SqlTypeUtil.equalSansNullability(rexBuilder.typeFactory, e2.getType(), e.getType())) {
+      return e;
     }
     final RexNode e3 = rexBuilder.makeCast(e.getType(), e2, matchNullability, false);
     if (e3.equals(e)) {
@@ -792,7 +803,7 @@ public class RexSimplify {
     } else {
       e2 = rexBuilder.makeCall(e.getParserPosition(), e.op, operands);
     }
-    return simplifyUsingPredicates(e2, clazz);
+    return simplifyUsingPredicates(e2, clazz, unknownAs);
   }
 
 
@@ -1835,6 +1846,9 @@ public class RexSimplify {
                 SqlStdOperatorTable.IS_NULL, notSatisfiableNullable), UNKNOWN));
       }
     }
+    // Absorption law: a AND (a OR b) => a
+    absorb(terms, SqlKind.OR);
+
     // Add the NOT disjunctions back in.
     for (RexNode notDisjunction : notTerms) {
       terms.add(simplify(not(notDisjunction), UNKNOWN));
@@ -1964,7 +1978,9 @@ public class RexSimplify {
         // or weaken terms that are partially implied.
         // E.g. given predicate "x >= 5" and term "x between 3 and 10"
         // we weaken to term to "x between 5 and 10".
-        final RexNode term2 = simplifyUsingPredicates(term, clazz);
+        // Note: we use RexUnknownAs.FALSE because the current method
+        // simplifies AND expressions "For Unknown As False".
+        final RexNode term2 = simplifyUsingPredicates(term, clazz, FALSE);
         if (term2 != term) {
           terms.set(i, term = term2);
         }
@@ -2077,6 +2093,9 @@ public class RexSimplify {
     if (!Collections.disjoint(nullOperands, strongOperands)) {
       return rexBuilder.makeLiteral(false);
     }
+    // Absorption law: a AND (a OR b) => a
+    absorb(terms, SqlKind.OR);
+
     // Remove not necessary IS NOT NULL expressions.
     // Example. IS NOT NULL(x) AND x < 5  : x < 5
     for (RexNode operand : notNullOperands) {
@@ -2089,7 +2108,7 @@ public class RexSimplify {
   }
 
   private <C extends Comparable<C>> RexNode simplifyUsingPredicates(RexNode e,
-      Class<C> clazz) {
+      Class<C> clazz, RexUnknownAs unknownAs) {
     if (predicates.pulledUpPredicates.isEmpty()) {
       return e;
     }
@@ -2118,6 +2137,13 @@ public class RexSimplify {
     } else if (rangeSet2.equals(RangeSets.rangeSetAll())) {
       // Range is always satisfied given these predicates; but nullability might
       // be problematic
+      if (unknownAs != UNKNOWN) {
+        // If unknownAs FALSE: row is already excluded for null input, so the IS_NOT_NULL
+        // guard is redundant, just return TRUE.
+        // If unknownAs TRUE: null rows pass regardless, and non-null rows also pass
+        // (range satisfied), the overall result is always TRUE.
+        return rexBuilder.makeLiteral(true);
+      }
       return simplify(
           rexBuilder.makeCall(RexUtil.getPos(e), SqlStdOperatorTable.IS_NOT_NULL, comparison.ref),
           RexUnknownAs.UNKNOWN);
@@ -2350,7 +2376,47 @@ public class RexSimplify {
         break;
       }
     }
+
+    // Absorption law: a OR (a AND b) => a
+    absorb(terms, SqlKind.AND);
+
     return RexUtil.composeDisjunction(rexBuilder, terms);
+  }
+
+  /**
+   * Applies the absorption law to a list of terms, removing any composite term
+   * that is absorbed by a sibling term.
+   *
+   * <p>When {@code compositeKind} is {@link SqlKind#OR}, removes any
+   * {@code (a OR b)} term whose disjunctions contain a sibling {@code a}, so
+   * {@code a AND (a OR b) => a}. When it is {@link SqlKind#AND}, removes any
+   * {@code (a AND b)} term whose conjunctions contain a sibling {@code a}, so
+   * {@code a OR (a AND b) => a}.
+   *
+   * <p>The absorbing sibling {@code a} must be deterministic; otherwise its two
+   * occurrences might evaluate differently and the rewrite would not be
+   * equivalence-preserving.
+   */
+  private static void absorb(List<RexNode> terms, SqlKind compositeKind) {
+    if (terms.size() > MAX_TERMS_FOR_ABSORPTION) {
+      return;
+    }
+    for (int i = 0; i < terms.size(); i++) {
+      final RexNode term = terms.get(i);
+      if (term.getKind() == compositeKind) {
+        final List<RexNode> components = compositeKind == SqlKind.OR
+            ? RelOptUtil.disjunctions(term)
+            : RelOptUtil.conjunctions(term);
+        for (RexNode other : terms) {
+          if (other != term && components.contains(other)
+              && RexUtil.isDeterministic(other)) {
+            terms.remove(i);
+            i--;
+            break;
+          }
+        }
+      }
+    }
   }
 
   private Pair<Comparable, RuntimeException> evaluate(RexNode e, Map<RexNode, Comparable> map) {

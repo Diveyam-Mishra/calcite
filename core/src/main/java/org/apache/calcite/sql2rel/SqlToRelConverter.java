@@ -2480,6 +2480,13 @@ public class SqlToRelConverter {
     final SqlLambdaScope scope = (SqlLambdaScope) validator().getLambdaScope(call);
 
     final Map<String, RexNode> nameToNodeMap = new HashMap<>();
+    // For nested lambdas, inherit the parent blackboard's nameToNodeMap so that
+    // the inner lambda can resolve references to outer lambda parameters.
+    // e.g., in x -> EXISTS(arr, y -> x + y = 4), the inner lambda's blackboard
+    // needs access to "X" from the outer lambda's nameToNodeMap.
+    if (bb.nameToNodeMap != null) {
+      nameToNodeMap.putAll(bb.nameToNodeMap);
+    }
     final List<RexLambdaRef> parameters = new ArrayList<>(scope.getParameterTypes().size());
     final Map<String, RelDataType> parameterTypes = scope.getParameterTypes();
 
@@ -2504,6 +2511,11 @@ public class SqlToRelConverter {
     SqlCall call = (SqlCall) node;
     bb.getValidator().deriveType(bb.scope, call);
     SqlCall aggCall = call.operand(0);
+    @Nullable SqlNode filter = null;
+    if (aggCall.getKind() == SqlKind.FILTER) {
+      filter = aggCall.operand(1);
+      aggCall = aggCall.operand(0);
+    }
     boolean ignoreNulls = false;
     switch (aggCall.getKind()) {
     case IGNORE_NULLS:
@@ -2515,6 +2527,31 @@ public class SqlToRelConverter {
     default:
       break;
     }
+    // "agg WITHIN GROUP (ORDER BY ...) OVER (...)": the WITHIN GROUP sort key
+    // (used by inverse distribution functions such as PERCENTILE_CONT/DISC) is
+    // carried as the window's ORDER BY. Oracle forbids ORDER BY inside the OVER
+    // clause for these functions, so the window's own order list is empty here.
+    @Nullable SqlNodeList groupOrderList = null;
+    if (aggCall.getKind() == SqlKind.WITHIN_GROUP) {
+      groupOrderList = aggCall.operand(1);
+      aggCall = aggCall.operand(0);
+    }
+    if (filter != null) {
+      final SqlOperator op = aggCall.getOperator();
+      if (op instanceof SqlAggFunction
+          && !((SqlAggFunction) op).requiresOver()) {
+        // FILTER on a windowed aggregate can be implemented by wrapping the
+        // aggregate arguments in CASE expressions, because true aggregates
+        // ignore NULL inputs. This does not work for window value functions
+        // (FIRST_VALUE, LAST_VALUE, NTH_VALUE, LEAD, LAG, etc.) which do not
+        // ignore NULL inputs.
+        aggCall = applyFilterToAggArgs(aggCall, filter);
+        bb.getValidator().deriveType(bb.scope, aggCall);
+      } else {
+        throw new UnsupportedOperationException(
+            "FILTER clause is not supported for window function " + op.getName());
+      }
+    }
 
     SqlNode windowOrRef = call.operand(1);
     final SqlWindow window =
@@ -2523,9 +2560,20 @@ public class SqlToRelConverter {
     SqlNode sqlLowerBound = window.getLowerBound();
     SqlNode sqlUpperBound = window.getUpperBound();
     boolean rows = window.isRows();
-    SqlNodeList orderList = window.getOrderList();
+    // For "agg WITHIN GROUP (ORDER BY ...) OVER (...)", the sort key comes from
+    // the WITHIN GROUP clause rather than the window's own (empty) ORDER BY.
+    SqlNodeList orderList =
+        groupOrderList != null ? groupOrderList : window.getOrderList();
 
-    if (!aggCall.getOperator().allowsFraming()) {
+    if (groupOrderList != null) {
+      // For "agg WITHIN GROUP (ORDER BY ...) OVER (...)", the sort key orders
+      // the aggregate's input but does not restrict the window frame: the
+      // aggregate is computed over the whole partition and broadcast to every
+      // row (matching Oracle). Force a full-partition frame so that framing
+      // aggregates such as LISTAGG do not accumulate row by row.
+      sqlLowerBound = SqlWindow.createUnboundedPreceding(SqlParserPos.ZERO);
+      sqlUpperBound = SqlWindow.createUnboundedFollowing(SqlParserPos.ZERO);
+    } else if (!aggCall.getOperator().allowsFraming()) {
       // If the operator does not allow framing, bracketing is implicitly
       // everything up to the current row.
       sqlLowerBound = SqlWindow.createUnboundedPreceding(SqlParserPos.ZERO);
@@ -2607,6 +2655,47 @@ public class SqlToRelConverter {
     } finally {
       bb.window = null;
     }
+  }
+
+  /**
+   * Applies a FILTER clause to the arguments of an aggregate call by wrapping
+   * each argument in a CASE expression. For example,
+   * {@code SUM(sal) FILTER (WHERE comm IS NOT NULL)} becomes
+   * {@code SUM(CASE WHEN comm IS NOT NULL THEN sal END)}.
+   *
+   * <p>This transformation preserves the semantics of the FILTER clause for
+   * windowed aggregates: rows that do not satisfy the filter contribute NULL
+   * and are ignored by the aggregate function.
+   */
+  private static SqlCall applyFilterToAggArgs(SqlCall aggCall, SqlNode filter) {
+    final SqlOperator op = aggCall.getOperator();
+    final List<SqlNode> operands = aggCall.getOperandList();
+    final SqlParserPos pos = aggCall.getParserPosition();
+    final SqlLiteral quantifier = aggCall.getFunctionQuantifier();
+    final List<SqlNode> newOperands = new ArrayList<>(operands.size());
+    if (op == SqlStdOperatorTable.COUNT
+        && operands.size() == 1
+        && operands.get(0) instanceof SqlIdentifier
+        && ((SqlIdentifier) operands.get(0)).isStar()) {
+      // COUNT(*) FILTER (WHERE x) => COUNT(CASE WHEN x THEN 0 END)
+      newOperands.add(
+          new SqlCase(pos, null, SqlNodeList.of(filter),
+              SqlNodeList.of(SqlLiteral.createExactNumeric("0", pos)),
+              SqlLiteral.createNull(pos)));
+    } else {
+      for (SqlNode operand : operands) {
+        if (operand instanceof SqlIdentifier
+            && ((SqlIdentifier) operand).isStar()) {
+          newOperands.add(operand);
+        } else {
+          newOperands.add(
+              new SqlCase(pos, null, SqlNodeList.of(filter),
+                  SqlNodeList.of(operand),
+                  SqlLiteral.createNull(pos)));
+        }
+      }
+    }
+    return op.createCall(quantifier, pos, newOperands);
   }
 
   protected void convertFrom(
@@ -2795,10 +2884,21 @@ public class SqlToRelConverter {
     RelNode uncollect;
     try {
       if (validator().config().conformance().allowAliasUnnestItems()) {
+        // Without an AS column list, mirror SqlUnnestOperator#inferReturnType
+        // so Uncollect's row type stays aligned with the validator.
+        List<String> itemAliases;
+        if (fieldNames != null) {
+          itemAliases = fieldNames;
+        } else {
+          itemAliases = new ArrayList<>(nodes.size());
+          for (int i = 0; i < nodes.size(); i++) {
+            itemAliases.add(SqlUtil.deriveAliasFromOrdinal(i));
+          }
+        }
         uncollect = relBuilder
             .push(child)
             .project(exprs)
-            .uncollect(requireNonNull(fieldNames, "fieldNames"), operator.withOrdinality)
+            .uncollect(itemAliases, operator.withOrdinality)
             .build();
       } else {
         // REVIEW danny 2020-04-26: should we unify the normal field aliases and
@@ -2867,32 +2967,7 @@ public class SqlToRelConverter {
     final Set<String> patternVarsSet = new HashSet<>();
     SqlNode pattern = matchRecognize.getPattern();
     final SqlBasicVisitor<@Nullable RexNode> patternVarVisitor =
-        new SqlBasicVisitor<@Nullable RexNode>() {
-          @Override public RexNode visit(SqlCall call) {
-            List<SqlNode> operands = call.getOperandList();
-            List<RexNode> newOperands = new ArrayList<>();
-            for (SqlNode node : operands) {
-              RexNode arg = requireNonNull(node.accept(this), node::toString);
-              newOperands.add(arg);
-            }
-            return rexBuilder.makeCall(call.getParserPosition(),
-              validator().getUnknownType(), call.getOperator(), newOperands);
-          }
-
-          @Override public RexNode visit(SqlIdentifier id) {
-            assert id.isSimple();
-            patternVarsSet.add(id.getSimple());
-            return rexBuilder.makeLiteral(id.getSimple());
-          }
-
-          @Override public RexNode visit(SqlLiteral literal) {
-            if (literal instanceof SqlNumericLiteral) {
-              return rexBuilder.makeExactLiteral(BigDecimal.valueOf(literal.intValue(true)));
-            } else {
-              return rexBuilder.makeLiteral(literal.booleanValue());
-            }
-          }
-        };
+        new PatternVarVisitor(patternVarsSet);
     final RexNode patternNode = pattern.accept(patternVarVisitor);
     if (patternNode == null) {
       throw new AssertionError("pattern is not found in " + pattern);
@@ -5686,11 +5761,16 @@ public class SqlToRelConverter {
         SqlQualified qualified) {
       if (nameToNodeMap != null && qualified.prefixLength == 1) {
         RexNode node = nameToNodeMap.get(qualified.identifier.names.get(0));
-        if (node == null) {
+        if (node != null) {
+          return Pair.of(node, null);
+        }
+        // If the identifier is not found in nameToNodeMap and the current scope
+        // is a lambda scope, fall through to standard scope resolution to allow
+        // external references (e.g., t2.v in a JOIN ON lambda expression).
+        if (!(scope instanceof SqlLambdaScope)) {
           throw new AssertionError("Unknown identifier '" + qualified.identifier
               + "' encountered while expanding expression");
         }
-        return Pair.of(node, null);
       }
       final SqlNameMatcher nameMatcher =
           scope.getValidator().getCatalogReader().nameMatcher();
@@ -5709,6 +5789,13 @@ public class SqlToRelConverter {
       // preserved.
       final SqlValidatorScope ancestorScope = resolve.scope;
       boolean isParent = ancestorScope != scope;
+      // When in a lambda scope, external references to tables that are part
+      // of the current blackboard's inputs should be resolved locally, not
+      // as correlation variables. The lambda blackboard inherits inputs from
+      // its parent blackboard.
+      if (isParent && scope instanceof SqlLambdaScope && inputs != null) {
+        isParent = false;
+      }
       if ((inputs != null) && !isParent) {
         final LookupContext rels =
             new LookupContext(this, inputs, systemFieldList.size());
@@ -7010,6 +7097,40 @@ public class SqlToRelConverter {
         return measureScope.lookupMeasure(identifier.getSimple());
       }
       return super.lookupMeasure(identifier);
+    }
+  }
+
+  /** Visitor for {@link #convertMatchRecognize(Blackboard, SqlMatchRecognize)}. */
+  private class PatternVarVisitor extends SqlBasicVisitor<@Nullable RexNode> {
+    private final Set<String> patternVarsSet;
+
+    PatternVarVisitor(Set<String> patternVarsSet) {
+      this.patternVarsSet = patternVarsSet;
+    }
+
+    @Override public RexNode visit(SqlCall call) {
+      List<SqlNode> operands = call.getOperandList();
+      List<RexNode> newOperands = new ArrayList<>();
+      for (SqlNode node : operands) {
+        RexNode arg = requireNonNull(node.accept(this), node::toString);
+        newOperands.add(arg);
+      }
+      return rexBuilder.makeCall(call.getParserPosition(),
+        validator().getUnknownType(), call.getOperator(), newOperands);
+    }
+
+    @Override public RexNode visit(SqlIdentifier id) {
+      assert id.isSimple();
+      patternVarsSet.add(id.getSimple());
+      return rexBuilder.makeLiteral(id.getSimple());
+    }
+
+    @Override public RexNode visit(SqlLiteral literal) {
+      if (literal instanceof SqlNumericLiteral) {
+        return rexBuilder.makeExactLiteral(BigDecimal.valueOf(literal.intValue(true)));
+      } else {
+        return rexBuilder.makeLiteral(literal.booleanValue());
+      }
     }
   }
 }

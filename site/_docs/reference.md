@@ -191,7 +191,7 @@ query:
       |   query MINUS [ ALL | DISTINCT ] query
       |   query INTERSECT [ ALL | DISTINCT ] query
       }
-      [ ORDER BY orderItem [, orderItem ]* ]
+      [ ORDER BY { ALL [ ASC | DESC ] [ NULLS FIRST | NULLS LAST ] | orderItem [, orderItem]* } ]
       [ LIMIT [ start, ] { count | ALL } ]
       [ OFFSET start { ROW | ROWS } ]
       [ FETCH { FIRST | NEXT } [ count ] { ROW | ROWS } ONLY ]
@@ -421,8 +421,20 @@ in those same conformance levels, any *column* in *insert* may be replaced by
 In *orderItem*, if *expression* is a positive integer *n*, it denotes
 the <em>n</em>th item in the SELECT clause.
 
-In *query*, *count* and *start* may each be either an unsigned integer literal
-or a dynamic parameter whose value is an integer.
+`ORDER BY ALL` sorts by every expression in the SELECT clause,
+in the order that they appear in the list; for example:
+"SELECT x, y FROM t ORDER BY ALL" is equivalent to
+"SELECT x, y FROM t ORDER BY x, y"
+An optional trailing ASC / DESC and NULLS FIRST / NULLS LAST applies to all keys.
+
+In *query*, *start* may be either an unsigned numeric literal or a dynamic
+parameter whose value is numeric. The *count* in a LIMIT clause may be either
+an unsigned numeric literal or a dynamic parameter whose value is numeric. The
+*count* in a FETCH clause may be an unsigned numeric literal, a dynamic
+parameter whose value is numeric, or a scalar expression enclosed in
+parentheses. A FETCH *count* expression cannot reference columns from the query
+input, and cannot contain aggregate functions, window functions, or sub-queries.
+Support for decimal or non-integer values is adapter-dependent.
 
 An aggregate query is a query that contains a GROUP BY or a HAVING
 clause, or aggregate functions in the SELECT clause. In the SELECT,
@@ -2160,6 +2172,28 @@ The *exclude* clause can be one of:
 `DISTINCT`, `FILTER` and `WITHIN GROUP` are as described for aggregate
 functions.
 
+#### WITHIN GROUP clause in window functions
+
+Combining a `WITHIN GROUP (ORDER BY ...)` clause with an `OVER` clause lets an
+aggregate function whose ordering is supplied by `WITHIN GROUP` be used as a
+window function, as in
+
+{% highlight sql %}
+LISTAGG(ename, ',') WITHIN GROUP (ORDER BY ename) OVER (PARTITION BY deptno)
+{% endhighlight %}
+
+The `WITHIN GROUP` order key orders the function's input but does not restrict
+the window frame: the function is computed over the whole partition and the
+result is broadcast to every row of that partition. Because the sort key is
+supplied by `WITHIN GROUP`, the `OVER` clause must not contain its own
+`ORDER BY` or frame specification.
+
+This is non-standard syntax (supported by Oracle) and is only allowed under a
+conformance that returns true for
+[SqlConformance.allowWithinGroupOverAggregate()]({{ site.apiRoot }}/org/apache/calcite/sql/validate/SqlConformance.html#allowWithinGroupOverAggregate--),
+such as `BABEL`; otherwise the validator reports "OVER must be applied to
+aggregate function".
+
 #### FILTER clause in window functions
 
 When `FILTER` is used with window functions, it is applied in the following order:
@@ -2967,7 +3001,8 @@ In the following:
 | * | BITAND(value1, value2)                         | Returns the bitwise AND of *value1* and *value2*. *value1* and *value2* must both be integer or binary values. Binary values must be of the same length.
 | * | BITOR(value1, value2)                          | Returns the bitwise OR of *value1* and *value2*. *value1* and *value2* must both be integer or binary values. Binary values must be of the same length.
 | * | BITXOR(value1, value2)                         | Returns the bitwise XOR of *value1* and *value2*. *value1* and *value2* must both be integer or binary values. Binary values must be of the same length.
-| * | LEFTSHIFT(value1, value2) | Returns the result of left-shifting *value1* by *value2* bits. *value1* can be integer, unsigned integer, or binary. For binary, the result has the same length as *value1*. The shift amount *value2* is normalized using modulo arithmetic based on the bit width of *value1*. For integers, this uses modulo 32; for binary types, it uses modulo (8 × byte_length). Negative shift amounts are converted to equivalent positive shifts through this modulo operation. For example, `LEFTSHIFT(1, -2)` returns `1073741824` (equivalent to `1 << 30`), and `LEFTSHIFT(8, -1)` returns `0` due to overflow.
+| * | LEFTSHIFT(value1, value2) | Returns the result of left-shifting *value1* by *value2* bits. *value1* can be integer, unsigned integer, or binary. For binary, the result has the same length as *value1*. The shift amount *value2* is normalized using modulo arithmetic: for signed integer types the modulus is 32 for `TINYINT`, `SMALLINT` and `INTEGER` (all backed by a 32-bit representation) and 64 for `BIGINT`; for unsigned integer types it matches the type's bit width (modulo 8, 16, 32 or 64); for binary types it is modulo (8 × N), where N is the actual length in bytes of the *value1* value — for a variable-length `VARBINARY` value this is the length of the value itself, not its declared maximum. For integer and unsigned types the sign of *value2* selects the direction: a non-negative amount shifts left and a negative amount shifts right by the normalized magnitude (for example, `LEFTSHIFT(1, -2)` returns `0`, a right shift by 30, and `LEFTSHIFT(8, -1)` returns `0`). For binary the shift is always to the left; a negative *value2* is simply folded into the range [0, 8 × N) by the same modulo.
+| * | RIGHTSHIFT(value1, value2) | Returns the result of right-shifting *value1* by *value2* bits. For signed integers the shift is arithmetic (the sign bit is preserved). *value1* can be integer or unsigned integer (binary right shift is not yet supported). The shift amount *value2* is normalized using modulo arithmetic: for signed integer types the modulus is 32 for `TINYINT`, `SMALLINT` and `INTEGER` (all backed by a 32-bit representation) and 64 for `BIGINT`; for unsigned integer types it matches the type's bit width (modulo 8, 16, 32 or 64). The sign of *value2* selects the direction: a non-negative amount shifts right and a negative amount shifts left by the normalized magnitude (for example, `RIGHTSHIFT(1024, 2)` returns `256`, `RIGHTSHIFT(-20, 2)` returns `-5`, and `RIGHTSHIFT(1, -2)` returns `1073741824`, a left shift by 30).
 | * | BITNOT(value)                                  | Returns the bitwise NOT of *value*. *value* must be either an integer type or a binary value.
 | f | BITAND_AGG(value)                              | Equivalent to `BIT_AND(value)`
 | f | BITOR_AGG(value)                               | Equivalent to `BIT_OR(value)`
@@ -3641,11 +3676,13 @@ optionKey:
 
 optionVal:
       simpleIdentifier
+  |   numericLiteral
   |   stringLiteral
 
 hintOption:
       simpleIdentifier
-   |  stringLiteral
+  |   numericLiteral
+  |   stringLiteral
 {% endhighlight %}
 
 It is experimental in Calcite, and yet not fully implemented, what we have implemented are:

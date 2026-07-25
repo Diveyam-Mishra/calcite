@@ -72,6 +72,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Type;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.sql.Date;
 import java.sql.Time;
@@ -111,6 +112,42 @@ public class EnumUtils {
 
   public static final List<String> LEFT_RIGHT =
       ImmutableList.of("left", "right");
+
+  /** Converts a FETCH or OFFSET runtime value to {@link BigDecimal}.
+   *
+   * <p>The value must be numeric and non-negative. */
+  public static BigDecimal numberToBigDecimal(@Nullable Object value, String kind) {
+    return numberToBigDecimal(value, kind, FetchOffsetRoundingPolicy.NONE);
+  }
+
+  /** Converts a FETCH or OFFSET runtime value to {@link BigDecimal}.
+   *
+   * <p>The value must be numeric and non-negative. The result is adjusted by
+   * the configured rounding policy. */
+  public static BigDecimal numberToBigDecimal(@Nullable Object value, String kind,
+      FetchOffsetRoundingPolicy roundingPolicy) {
+    if (value == null) {
+      throw new IllegalArgumentException(kind + " expression evaluated to NULL");
+    }
+    if (!(value instanceof Number)) {
+      throw new IllegalArgumentException(kind + " must be a number");
+    }
+    final Number number = (Number) value;
+    final BigDecimal decimal;
+    if (number instanceof BigDecimal) {
+      decimal = (BigDecimal) number;
+    } else if (number instanceof BigInteger) {
+      decimal = new BigDecimal((BigInteger) number);
+    } else if (number instanceof Float || number instanceof Double) {
+      decimal = BigDecimal.valueOf(number.doubleValue());
+    } else {
+      decimal = BigDecimal.valueOf(number.longValue());
+    }
+    if (decimal.signum() < 0) {
+      throw new IllegalArgumentException(kind + " must not be negative");
+    }
+    return roundingPolicy.round(decimal);
+  }
 
   /** Declares a method that overrides another method. */
   public static MethodDeclaration overridingMethodDecl(Method method,
@@ -987,7 +1024,7 @@ public class EnumUtils {
                         right_, rightPhysType)),
                 implementor.allCorrelateVariables,
                 implementor.getConformance(),
-                nullable)));
+                nullable, implementor.getRexImplementorTable())));
     Class clazz = nullable ? NullablePredicate2.class : Predicate2.class;
     return Expressions.lambda(clazz, builder.toBlock(), left_, right_);
   }
@@ -1052,12 +1089,29 @@ public class EnumUtils {
   public static Enumerable<@Nullable Object[]> sessionize(
       Enumerator<@Nullable Object[]> inputEnumerator,
       int indexOfWatermarkedColumn, int indexOfKeyColumn, long gap) {
-    return new AbstractEnumerable<@Nullable Object[]>() {
-      @Override public Enumerator<@Nullable Object[]> enumerator() {
-        return new SessionizationEnumerator(inputEnumerator,
-            indexOfWatermarkedColumn, indexOfKeyColumn, gap);
-      }
-    };
+    return new SessionizeEnumerable(inputEnumerator, indexOfWatermarkedColumn, indexOfKeyColumn,
+        gap);
+  }
+
+  /** Enumerable for {@link #sessionize(Enumerator, int, int, long)}. */
+  private static class SessionizeEnumerable extends AbstractEnumerable<@Nullable Object[]> {
+    private final Enumerator<@Nullable Object[]> inputEnumerator;
+    private final int indexOfWatermarkedColumn;
+    private final int indexOfKeyColumn;
+    private final long gap;
+
+    SessionizeEnumerable(Enumerator<@Nullable Object[]> inputEnumerator,
+        int indexOfWatermarkedColumn, int indexOfKeyColumn, long gap) {
+      this.inputEnumerator = inputEnumerator;
+      this.indexOfWatermarkedColumn = indexOfWatermarkedColumn;
+      this.indexOfKeyColumn = indexOfKeyColumn;
+      this.gap = gap;
+    }
+
+    @Override public Enumerator<@Nullable Object[]> enumerator() {
+      return new SessionizationEnumerator(inputEnumerator,
+          indexOfWatermarkedColumn, indexOfKeyColumn, gap);
+    }
   }
 
   /** Enumerator that converts rows into sessions separated by gaps. */
@@ -1200,12 +1254,31 @@ public class EnumUtils {
   public static Enumerable<@Nullable Object[]> hopping(
       Enumerator<@Nullable Object[]> inputEnumerator,
       int indexOfWatermarkedColumn, long emitFrequency, long windowSize, long offset) {
-    return new AbstractEnumerable<@Nullable Object[]>() {
-      @Override public Enumerator<@Nullable Object[]> enumerator() {
-        return new HopEnumerator(inputEnumerator,
-            indexOfWatermarkedColumn, emitFrequency, windowSize, offset);
-      }
-    };
+    return new HoppingEnumerable(inputEnumerator, indexOfWatermarkedColumn, emitFrequency,
+        windowSize, offset);
+  }
+
+  /** Enumerable for {@link #hopping(Enumerator, int, long, long, long)}. */
+  private static class HoppingEnumerable extends AbstractEnumerable<@Nullable Object[]> {
+    private final Enumerator<@Nullable Object[]> inputEnumerator;
+    private final int indexOfWatermarkedColumn;
+    private final long emitFrequency;
+    private final long windowSize;
+    private final long offset;
+
+    HoppingEnumerable(Enumerator<@Nullable Object[]> inputEnumerator,
+        int indexOfWatermarkedColumn, long emitFrequency, long windowSize, long offset) {
+      this.inputEnumerator = inputEnumerator;
+      this.indexOfWatermarkedColumn = indexOfWatermarkedColumn;
+      this.emitFrequency = emitFrequency;
+      this.windowSize = windowSize;
+      this.offset = offset;
+    }
+
+    @Override public Enumerator<@Nullable Object[]> enumerator() {
+      return new HopEnumerator(inputEnumerator,
+          indexOfWatermarkedColumn, emitFrequency, windowSize, offset);
+    }
   }
 
   /** Enumerator that computes HOP. */

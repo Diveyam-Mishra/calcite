@@ -1254,6 +1254,25 @@ public class SqlParserTest {
         .ok("((NOT (NOT (`A` = `B`))) OR (NOT (NOT (`C` = `D`))))");
   }
 
+  @Test void testShiftOperators() {
+    expr("1 << 2")
+        .ok("(1 << 2)");
+    // '>>' is recognized as two adjacent '>' tokens.
+    expr("1 >> 2")
+        .ok("(1 >> 2)");
+
+    // '<<' and '>>' have the same precedence and are left-associative.
+    expr("a << b >> c")
+        .ok("((`A` << `B`) >> `C`)");
+    expr("a >> b >> c")
+        .ok("((`A` >> `B`) >> `C`)");
+
+    // The two '>' of a right shift must be adjacent, so "a > > b" (with a space
+    // between the '>' characters) is not parsed as a right shift.
+    expr("a ^>^ > b")
+        .fails("(?s).*Encountered \"> >\" at line 1, column 3\\..*");
+  }
+
   @Test void testIsBooleans() {
     String[] inOuts = {"NULL", "TRUE", "FALSE", "UNKNOWN"};
 
@@ -2859,6 +2878,16 @@ public class SqlParserTest {
   }
 
   /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-5216">[CALCITE-5216]
+   * Cannot parse parenthesized nested WITH clause</a>. */
+  @Test void testNestedWithParenthesized() {
+    final String sql = "with a as (with b as (select 1)(select 1)) select * from a";
+    final String expected = "WITH `A` AS (WITH `B` AS (SELECT 1) SELECT 1) SELECT *\n"
+        + "FROM `A`";
+    sql(sql).ok(expected);
+  }
+
+  /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-5252">[CALCITE-5252]
    * JDBC adapter sometimes miss parentheses around SELECT in WITH_ITEM body</a>. */
   @Test void testWithAsUnion() {
@@ -3947,6 +3976,36 @@ public class SqlParserTest {
             + "ORDER BY `EMPNO`, `GENDER` DESC, `DEPTNO`, `EMPNO`, `NAME` DESC");
   }
 
+  @Test void testOrderByAll() {
+    final String sql = "select x, y from t\n"
+        + "order by all";
+    final String expected = "SELECT `X`, `Y`\n"
+        + "FROM `T`\n"
+        + "ORDER BY ALL";
+    sql(sql).ok(expected);
+
+    final String sql1 = "select x, y from t\n"
+        + "order by all desc";
+    final String expected1 = "SELECT `X`, `Y`\n"
+        + "FROM `T`\n"
+        + "ORDER BY ALL DESC";
+    sql(sql1).ok(expected1);
+
+    final String sql2 = "select x, y from t\n"
+        + "order by all desc nulls last";
+    final String expected2 = "SELECT `X`, `Y`\n"
+        + "FROM `T`\n"
+        + "ORDER BY ALL DESC NULLS LAST";
+    sql(sql2).ok(expected2);
+
+    final String sql3 = "select x, y from t\n"
+        + "order by all nulls first";
+    final String expected3 = "SELECT `X`, `Y`\n"
+        + "FROM `T`\n"
+        + "ORDER BY ALL NULLS FIRST";
+    sql(sql3).ok(expected3);
+  }
+
   @Test void testOrderNullsFirst() {
     final String sql = "select * from emp\n"
         + "order by gender desc nulls last,\n"
@@ -4045,12 +4104,31 @@ public class SqlParserTest {
             + "FROM `FOO`\n"
             + "OFFSET ? ROWS\n"
             + "FETCH NEXT ? ROWS ONLY");
+    // CALCITE-7592: Arithmetic and scalar expressions are allowed within parentheses.
+    sql("select a from foo fetch next (1 + abs(-2)) rows only")
+        .ok("SELECT `A`\n"
+            + "FROM `FOO`\n"
+            + "FETCH NEXT (1 + ABS(-2)) ROWS ONLY");
+    // Expressions without parentheses are not allowed.
+    sql("select a from foo fetch next 1 ^+^ 2 rows only")
+        .fails("(?s).*Encountered \"\\+\" at .*");
+    sql("select a from foo fetch next ? ^+^ abs(2) rows only")
+        .fails("(?s).*Encountered \"\\+\" at .*");
     // missing ROWS after FETCH
     sql("select a from foo offset 1 fetch next 3 ^only^")
         .fails("(?s).*Encountered \"only\" at .*");
     // FETCH before OFFSET is illegal
     sql("select a from foo fetch next 3 rows only ^offset^ 1")
         .fails("(?s).*Encountered \"offset\" at .*");
+    // Subqueries are not allowed in FETCH
+    sql("select a from foo fetch next ^select^ 2 rows only")
+        .fails("(?s).*Encountered \"select\" at .*");
+    sql("select a from foo fetch next (^select^ 2) rows only")
+        .fails("(?s).*Encountered \"select\" at .*");
+    sql("select a from foo fetch next (^select^ ?) rows only")
+        .fails("(?s).*Encountered \"select\" at .*");
+    sql("select a from foo fetch next (^select^ max(a) from foo) rows only")
+        .fails("(?s).*Encountered \"select\" at .*");
   }
 
   /**
@@ -4948,8 +5026,9 @@ public class SqlParserTest {
     final String sql =
         "select * from table(topn(table orders partition by (orderId, productid), 3))";
     final String expected = "SELECT *\n"
-        + "FROM TABLE(`TOPN`((TABLE `ORDERS`) PARTITION BY `ORDERID`, `PRODUCTID`, 3))";
+        + "FROM TABLE(`TOPN`((TABLE `ORDERS`) PARTITION BY (`ORDERID`, `PRODUCTID`), 3))";
     sql(sql).ok(expected);
+    sql(expected).withConfig(c -> c.withQuoting(Quoting.BACK_TICK)).same();
   }
 
   @Test void testTableFunctionWithOrderKey() {
@@ -4966,8 +5045,9 @@ public class SqlParserTest {
     final String sql =
         "select * from table(topn(table orders order by (orderId, productid), 3))";
     final String expected = "SELECT *\n"
-        + "FROM TABLE(`TOPN`((TABLE `ORDERS`) ORDER BY `ORDERID`, `PRODUCTID`, 3))";
+        + "FROM TABLE(`TOPN`((TABLE `ORDERS`) ORDER BY (`ORDERID`, `PRODUCTID`), 3))";
     sql(sql).ok(expected);
+    sql(expected).withConfig(c -> c.withQuoting(Quoting.BACK_TICK)).same();
   }
 
   @Test void testTableFunctionWithComplexOrderBy() {
@@ -4975,8 +5055,9 @@ public class SqlParserTest {
     final String sql =
         "select * from table(topn(table orders order by (orderId desc, productid asc), 3))";
     final String expected = "SELECT *\n"
-        + "FROM TABLE(`TOPN`((TABLE `ORDERS`) ORDER BY `ORDERID` DESC, `PRODUCTID`, 3))";
+        + "FROM TABLE(`TOPN`((TABLE `ORDERS`) ORDER BY (`ORDERID` DESC, `PRODUCTID`), 3))";
     sql(sql).ok(expected);
+    sql(expected).withConfig(c -> c.withQuoting(Quoting.BACK_TICK)).same();
   }
 
   @Test void testTableFunctionWithPartitionKeyAndOrderKey() {
@@ -9815,7 +9896,12 @@ public class SqlParserTest {
     final String sql1 = "select "
         + "/*+ properties(^k1^=123, k2='v2'), no_hash_join() */ "
         + "empno, ename, deptno from emps";
-    sql(sql1).fails("(?s).*Encountered \"k1 = 123\" at .*");
+    // Allow numeric literal k/v values.
+    final String expected1 = "SELECT\n"
+        + "/*+ `PROPERTIES`(`K1` = 123, `K2` = 'v2'), `NO_HASH_JOIN` */\n"
+        + "`EMPNO`, `ENAME`, `DEPTNO`\n"
+        + "FROM `EMPS`";
+    sql(sql1).ok(expected1);
     final String sql2 = "select "
         + "/*+ properties(k1, k2^=^'v2'), no_hash_join */ "
         + "empno, ename, deptno from emps";
@@ -9910,6 +9996,11 @@ public class SqlParserTest {
 
     sql("select 1 || (a, b) ^->^ a + b")
         .fails(errorMessage2);
+
+    // Nested lambda: inner lambda in a function call within the outer lambda body
+    sql("select higher_order_func(x -> higher_order_func(y -> x + y, 1), 1) from t")
+        .ok("SELECT `HIGHER_ORDER_FUNC`(`X` -> `HIGHER_ORDER_FUNC`(`Y` -> (`X` + `Y`), 1), 1)\n"
+            + "FROM `T`");
   }
 
   /**

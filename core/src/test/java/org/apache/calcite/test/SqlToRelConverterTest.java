@@ -182,6 +182,19 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
         .ok();
   }
 
+  /** Test case for nested lambda: inner lambda references outer lambda
+   * parameter. Verifies that 'x' in the inner lambda is resolved from the
+   * outer lambda scope, not treated as a table column name. */
+  @Test void testNestedLambdaExpression() {
+    final String sql =
+        "select \"EXISTS\"(array(1,2,3), x -> \"EXISTS\"(array(1,2,3), y -> x + y = 4))";
+    fixture()
+        .withFactory(c ->
+            c.withOperatorTable(t -> SqlValidatorTest.operatorTableFor(SqlLibrary.SPARK)))
+        .withSql(sql)
+        .ok();
+  }
+
   @Test void testDotLiteralAfterRow() {
     final String sql = "select row(1,2).\"EXPR$1\" from emp";
     sql(sql).ok();
@@ -1251,6 +1264,15 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
   }
 
   /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testFetchWithExpression() {
+    final String sql =
+        "select empno from emp fetch next (1 + abs(-2)) rows only";
+    sql(sql).ok();
+  }
+
+  /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-439">[CALCITE-439]
    * SqlValidatorUtil.uniquify() may not terminate under some conditions</a>. */
   @Test void testGroupAlias() {
@@ -1886,6 +1908,20 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
     sql(sql).withDecorrelate(false).ok();
   }
 
+  /** Test case for CURSOR containing UNION ALL. */
+  @Test void testCollectionTableWithCursorParamUnion() {
+    final String sql = "select * from table(dedup("
+        + "cursor(select ename from emp union all select ename from emp), 'NAME'))";
+    sql(sql).withDecorrelate(false).ok();
+  }
+
+  /** Test case for CURSOR containing UNION (distinct). */
+  @Test void testCollectionTableWithCursorParamUnionDistinct() {
+    final String sql = "select * from table(dedup("
+        + "cursor(select ename from emp union select ename from emp), 'NAME'))";
+    sql(sql).withDecorrelate(false).ok();
+  }
+
   @Test void testUnnest() {
     final String sql = "select*from unnest(multiset[1,2])";
     sql(sql).ok();
@@ -1965,6 +2001,39 @@ class SqlToRelConverterTest extends SqlToRelTestBase {
         + "from dept_nested_expanded as d CROSS JOIN\n"
         + " UNNEST(d.admins, d.employees) as t(e, k)";
     sql(sql).withConformance(SqlConformanceEnum.BIG_QUERY).ok();
+  }
+
+  /**
+   * Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7546">[CALCITE-7546]
+   * NullPointerException in SqlToRelConverter for UNNEST(array) AS alias under
+   * conformance with allowAliasUnnestItems=true</a>.
+   */
+  @Test void testAliasUnnestArrayPlanWithoutColumnList() {
+    final String sql = "select d.deptno, e.empno\n"
+        + "from dept_nested_expanded as d,\n"
+        + " UNNEST(d.employees) as e";
+    sql(sql).withConformance(SqlConformanceEnum.PRESTO).ok();
+  }
+
+  @Test void testAliasUnnestScalarArrayPlanWithoutColumnList() {
+    final String sql = "select d.deptno, a\n"
+        + "from dept_nested_expanded as d,\n"
+        + " UNNEST(d.admins) as a";
+    sql(sql).withConformance(SqlConformanceEnum.PRESTO).ok();
+  }
+
+  /**
+   * Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7546">[CALCITE-7546]
+   * NullPointerException in SqlToRelConverter for UNNEST(array) AS alias under
+   * conformance with allowAliasUnnestItems=true</a>, using the exact array
+   * literal reproduction from the issue.
+   */
+  @Test void testAliasUnnestArrayLiteralPlanWithoutColumnList() {
+    final String sql = "select t\n"
+        + "from UNNEST(ARRAY[1, 2, 3]) as t";
+    sql(sql).withConformance(SqlConformanceEnum.PRESTO).ok();
   }
 
   @Test void testArrayOfRecord() {

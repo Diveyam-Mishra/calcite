@@ -86,6 +86,7 @@ import org.apache.calcite.rex.RexSimplify;
 import org.apache.calcite.rex.RexSubQuery;
 import org.apache.calcite.rex.RexUnknownAs;
 import org.apache.calcite.rex.RexUtil;
+import org.apache.calcite.rex.RexVisitorImpl;
 import org.apache.calcite.rex.RexWindowBound;
 import org.apache.calcite.rex.RexWindowBounds;
 import org.apache.calcite.rex.RexWindowExclusion;
@@ -108,6 +109,7 @@ import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.SqlReturnTypeInference;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.calcite.sql.type.SqlTypeUtil;
 import org.apache.calcite.sql.type.TableFunctionReturnTypeInference;
 import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.sql2rel.SqlToRelConverter;
@@ -1938,9 +1940,13 @@ public class RelBuilder {
     if (config.simplify()) {
       conjunctionPredicates = simplifier.simplifyFilterPredicates(predicates);
     } else {
+      // The config says "do not simplify", but without the following optimizations
+      // filter construction may fail because the predicates do not respect
+      // invariants checked by the filter constructor in Filter.isValid().
       List<RexNode> simplified = new ArrayList<>();
       for (RexNode predicate : predicates) {
-        RexNode simple = RexSimplify.simplifyComparisonWithNull(predicate, getRexBuilder());
+        RexNode simple = simplifier.removeNullabilityCast(predicate);
+        simple = RexSimplify.simplifyComparisonWithNull(simple, getRexBuilder());
         simplified.add(simple);
       }
       conjunctionPredicates =
@@ -3797,8 +3803,7 @@ public class RelBuilder {
    *
    * @param offsetNode RexLiteral means number of rows to skip is deterministic,
    *                   RexDynamicParam means number of rows to skip is dynamic.
-   * @param fetchNode  RexLiteral means maximum number of rows to fetch is deterministic,
-   *                   RexDynamicParam mean maximum number is dynamic.
+   * @param fetchNode  Maximum number of rows to fetch
    * @param nodes      Sort expressions
    */
   public RelBuilder sortLimit(@Nullable RexNode offsetNode, @Nullable RexNode fetchNode,
@@ -3808,12 +3813,17 @@ public class RelBuilder {
         throw new IllegalArgumentException("OFFSET node must be RexLiteral or RexDynamicParam");
       }
     }
-    if (fetchNode != null) {
-      if (!(fetchNode instanceof RexLiteral || fetchNode instanceof RexDynamicParam)) {
-        throw new IllegalArgumentException("FETCH node must be RexLiteral or RexDynamicParam");
-      }
+    if (fetchNode != null && !isValidFetchExpression(fetchNode)) {
+      throw new IllegalArgumentException(
+          "FETCH node must not reference input fields or contain aggregate functions, "
+              + "window functions, or subqueries");
     }
-
+    if (fetchNode != null
+        && !SqlTypeUtil.isNumeric(fetchNode.getType())) {
+      throw new IllegalArgumentException(
+          "FETCH node must have a numeric type; actual type is "
+              + fetchNode.getType().getFullTypeString());
+    }
     final Registrar registrar = new Registrar(fields(), ImmutableList.of());
     final List<RelFieldCollation> fieldCollations =
         registrar.registerFieldCollations(nodes);
@@ -3878,6 +3888,38 @@ public class RelBuilder {
       project(registrar.originalExtraNodes);
     }
     return this;
+  }
+
+  private static boolean isValidFetchExpression(RexNode node) {
+    return Boolean.TRUE.equals(node.accept(new FetchExpressionVisitor()));
+  }
+
+  /** Visitor that validates FETCH expressions. */
+  private static class FetchExpressionVisitor
+      extends RexVisitorImpl<@Nullable Boolean> {
+    FetchExpressionVisitor() {
+      super(false);
+    }
+
+    @Override public Boolean visitLiteral(RexLiteral literal) {
+      return true;
+    }
+
+    @Override public Boolean visitDynamicParam(RexDynamicParam dynamicParam) {
+      return true;
+    }
+
+    @Override public Boolean visitCall(RexCall call) {
+      if (call.getOperator().isAggregator()) {
+        return false;
+      }
+      for (RexNode operand : call.getOperands()) {
+        if (!Boolean.TRUE.equals(operand.accept(this))) {
+          return false;
+        }
+      }
+      return true;
+    }
   }
 
   private static RelFieldCollation collation(RexNode node,
@@ -5058,6 +5100,15 @@ public class RelBuilder {
               ImmutableList.of()) {
             @Override public boolean hasEmptyGroup() {
               return !SqlWindow.isAlwaysNonEmpty(lowerBound, upperBound);
+            }
+
+            @Override public RelDataType getCollationType() {
+              // Inverse distribution functions such as PERCENTILE_CONT/DISC
+              // used as analytic functions ("... WITHIN GROUP (ORDER BY x)
+              // OVER (...)") derive their return type from the sort key.
+              checkArgument(!sortKeys.isEmpty(),
+                  "collation type requested but no sort key present");
+              return sortKeys.get(0).left.getType();
             }
           };
       final RelDataType type = op.inferReturnType(bind);

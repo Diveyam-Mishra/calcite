@@ -39,6 +39,10 @@ public class SqlDelegatingConformance implements SqlConformance {
     return delegate.allowCharLiteralAlias();
   }
 
+  @Override public boolean allowWithinGroupOverAggregate() {
+    return delegate.allowWithinGroupOverAggregate();
+  }
+
   @Override public boolean isSupportedDualTable() {
     return delegate.isSupportedDualTable();
   }
@@ -158,6 +162,10 @@ public class SqlDelegatingConformance implements SqlConformance {
     return delegate.allowQualifyingCommonColumn();
   }
 
+  @Override public boolean allowLambdaClosure() {
+    return delegate.allowLambdaClosure();
+  }
+
   @Override public boolean isValueAllowed() {
     return delegate.isValueAllowed();
   }
@@ -180,5 +188,9 @@ public class SqlDelegatingConformance implements SqlConformance {
 
   @Override public boolean isDistinctOnAllowed() {
     return delegate.isDistinctOnAllowed();
+  }
+
+  @Override public boolean isCorrelatedAggregateAllowed() {
+    return delegate.isCorrelatedAggregateAllowed();
   }
 }

@@ -133,6 +133,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TimeZone;
@@ -210,18 +211,34 @@ public class SqlFunctions {
 
   @SuppressWarnings("unused")
   private static final Function1<Object[], Enumerable<@Nullable Object[]>> ARRAY_CARTESIAN_PRODUCT =
-      lists -> {
-        final List<Enumerator<@Nullable Object>> enumerators = new ArrayList<>();
-        for (Object list : lists) {
-          enumerators.add(Linq4j.enumerator((List) list));
-        }
-        final Enumerator<List<@Nullable Object>> product = Linq4j.product(enumerators);
-        return new AbstractEnumerable<@Nullable Object[]>() {
-          @Override public Enumerator<@Nullable Object[]> enumerator() {
-            return Linq4j.transform(product, List::toArray);
-          }
-        };
-      };
+      SqlFunctions::arrayCartesianProduct;
+
+  /**
+   * WARNING: keep this logic as a static method. JDK 8 and 11 produce invalid bytecode when
+   * checkerframework annotations are used on static lambdas. See CALCITE-6393.
+   */
+  private static Enumerable<@Nullable Object[]> arrayCartesianProduct(Object[] lists) {
+    final List<Enumerator<@Nullable Object>> enumerators = new ArrayList<>();
+    for (Object list : lists) {
+      enumerators.add(Linq4j.enumerator((List) list));
+    }
+    final Enumerator<List<@Nullable Object>> product = Linq4j.product(enumerators);
+    return new ArrayCartesianProductEnumerable(product);
+  }
+
+  /** Enumerable for {@link #arrayCartesianProduct(Object[])}. */
+  private static class ArrayCartesianProductEnumerable
+      extends AbstractEnumerable<@Nullable Object[]> {
+    private final Enumerator<List<@Nullable Object>> product;
+
+    ArrayCartesianProductEnumerable(Enumerator<List<@Nullable Object>> product) {
+      this.product = product;
+    }
+
+    @Override public Enumerator<@Nullable Object[]> enumerator() {
+      return Linq4j.transform(product, List::toArray);
+    }
+  }
 
   /** Holds, for each thread, a map from sequence name to sequence current
    * value.
@@ -3773,14 +3790,29 @@ public class SqlFunctions {
   }
 
   /**
+   * Returns {@code x} modulo {@code m}, normalized to the range {@code [0, m)}
+   * (unlike {@code %}, the result is never negative). Used to normalize a shift
+   * amount to the bit width of the value being shifted.
+   *
+   * @param x the value (typically a shift amount, which may be negative)
+   * @param m the modulus, which must be positive (typically a bit width)
+   * @return {@code x} modulo {@code m}, in the range {@code [0, m)}
+   */
+  private static int positiveModulo(long x, int m) {
+    // Math.floorMod(long, int) is only available since JDK 9, so widen to
+    // Math.floorMod(long, long) and narrow the result (always in [0, m)) to int.
+    return (int) Math.floorMod(x, (long) m);
+  }
+
+  /**
    * Performs PostgresSQL-style bitwise shift on a 32-bit integer.
    *
    * @param x the integer value to shift
    * @param y the shift amount (positive: left shift, negative: right shift)
    * @return the shifted integer
    */
-  public static int leftShift(int x, int y) {
-    int shift = ((y % 32) + 32) % 32; // normalize to 0~31
+  public static int leftShift(int x, long y) {
+    int shift = positiveModulo(y, 32); // normalize to 0~31
     return y >= 0 ? x << shift : x >> shift; // arithmetic right shift
   }
 
@@ -3793,21 +3825,9 @@ public class SqlFunctions {
    * @param y the shift amount
    * @return the shifted long value
    */
-  public static long leftShift(long x, int y) {
-    int shift = ((y % 64) + 64) % 64; // normalize to 0~63
+  public static long leftShift(long x, long y) {
+    int shift = positiveModulo(y, 64); // normalize to 0~63
     return y >= 0 ? x << shift : x >> shift;
-  }
-
-  /**
-   * Performs PostgresSQL-style bitwise shift on an int value with a long shift amount.
-   *
-   * @param x the int value to shift
-   * @param y the long shift amount
-   * @return the shifted value as long
-   */
-  public static long leftShift(int x, long y) {
-    int shift = (int) (((y % 32) + 32) % 32); // normalize to 0~31
-    return y >= 0 ? (long) x << shift : (long) x >> shift;
   }
 
   /**
@@ -3819,7 +3839,7 @@ public class SqlFunctions {
    * @param y the shift amount in bits
    * @return the shifted byte array
    */
-  public static byte[] leftShift(byte[] bytes, int y) {
+  public static byte[] leftShift(byte[] bytes, long y) {
     if (bytes.length == 0) {
       return new byte[0];
     }
@@ -3828,7 +3848,7 @@ public class SqlFunctions {
 
     // PostgreSQL behavior: always treat as left shift with modulo arithmetic
     // Negative y becomes equivalent positive shift
-    int shift = ((y % bitLen) + bitLen) % bitLen;
+    int shift = positiveModulo(y, bitLen);
 
     if (shift == 0) {
       return bytes.clone();
@@ -3866,7 +3886,7 @@ public class SqlFunctions {
    * @param y the shift amount in bits
    * @return shifted ByteString
    */
-  public static ByteString leftShift(ByteString bytes, int y) {
+  public static ByteString leftShift(ByteString bytes, long y) {
     return new ByteString(leftShift(bytes.getBytes(), y));
   }
 
@@ -3874,8 +3894,8 @@ public class SqlFunctions {
    * Performs PostgresSQL-style bitwise shift on UByte.
    * Overflow bits are masked to 8 bits.
    */
-  public static UByte leftShift(UByte x, int y) {
-    int shift = ((y % 8) + 8) % 8;
+  public static UByte leftShift(UByte x, long y) {
+    int shift = positiveModulo(y, 8);
     int val = x.byteValue() & 0xFF;
     val = (y >= 0) ? (val << shift) & 0xFF : (val >> shift) & 0xFF;
     return UByte.valueOf((byte) val);
@@ -3885,8 +3905,8 @@ public class SqlFunctions {
    * Performs PostgresSQL-style bitwise shift on UShort.
    * Overflow bits are masked to 16 bits.
    */
-  public static UShort leftShift(UShort x, int y) {
-    int shift = ((y % 16) + 16) % 16;
+  public static UShort leftShift(UShort x, long y) {
+    int shift = positiveModulo(y, 16);
     int val = x.shortValue() & 0xFFFF;
     val = (y >= 0) ? (val << shift) & 0xFFFF : (val >> shift) & 0xFFFF;
     return UShort.valueOf((short) val);
@@ -3896,8 +3916,8 @@ public class SqlFunctions {
    * Performs PostgresSQL-style bitwise shift on UInteger.
    * Overflow bits are masked to 32 bits.
    */
-  public static UInteger leftShift(UInteger x, int y) {
-    int shift = ((y % 32) + 32) % 32;
+  public static UInteger leftShift(UInteger x, long y) {
+    int shift = positiveModulo(y, 32);
     long val = x.longValue() & 0xFFFFFFFFL;
     val = (y >= 0) ? (val << shift) & 0xFFFFFFFFL : (val >> shift) & 0xFFFFFFFFL;
     return UInteger.valueOf(val);
@@ -3907,10 +3927,86 @@ public class SqlFunctions {
    * Performs PostgresSQL-style bitwise shift on ULong.
    * Overflow bits are masked to 64 bits (long shifts naturally truncate).
    */
-  public static ULong leftShift(ULong x, int y) {
-    int shift = ((y % 64) + 64) % 64;
+  public static ULong leftShift(ULong x, long y) {
+    int shift = positiveModulo(y, 64);
     long val = x.longValue();
-    val = (y >= 0) ? val << shift : val >> shift;
+    // A negative shift amount shifts right; use a logical (unsigned) shift so
+    // the full-width ULong value is not sign-extended.
+    val = (y >= 0) ? val << shift : val >>> shift;
+    return ULong.valueOf(val);
+  }
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on a 32-bit integer.
+   *
+   * @param x the integer value to shift
+   * @param y the shift amount (positive: right shift, negative: left shift)
+   * @return the shifted integer
+   */
+  public static int rightShift(int x, long y) {
+    int shift = positiveModulo(y, 32); // normalize to 0~31
+    return y >= 0 ? x >> shift : x << shift; // arithmetic right shift
+  }
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on a 64-bit long value.
+   *
+   * @param x the long value to shift
+   * @param y the shift amount
+   * @return the shifted long value
+   */
+  public static long rightShift(long x, long y) {
+    int shift = positiveModulo(y, 64); // normalize to 0~63
+    return y >= 0 ? x >> shift : x << shift;
+  }
+
+  // Right shift on binary (byte[]/ByteString) is intentionally not implemented:
+  // BINARY/VARBINARY operands are rejected for >> and RIGHTSHIFT until the
+  // endianness of bitwise shifts on binary is settled. See [CALCITE-7651].
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on UByte.
+   * Overflow bits are masked to 8 bits.
+   */
+  public static UByte rightShift(UByte x, long y) {
+    int shift = positiveModulo(y, 8);
+    int val = x.byteValue() & 0xFF;
+    val = (y >= 0) ? (val >> shift) & 0xFF : (val << shift) & 0xFF;
+    return UByte.valueOf((byte) val);
+  }
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on UShort.
+   * Overflow bits are masked to 16 bits.
+   */
+  public static UShort rightShift(UShort x, long y) {
+    int shift = positiveModulo(y, 16);
+    int val = x.shortValue() & 0xFFFF;
+    val = (y >= 0) ? (val >> shift) & 0xFFFF : (val << shift) & 0xFFFF;
+    return UShort.valueOf((short) val);
+  }
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on UInteger.
+   * Overflow bits are masked to 32 bits.
+   */
+  public static UInteger rightShift(UInteger x, long y) {
+    int shift = positiveModulo(y, 32);
+    long val = x.longValue() & 0xFFFFFFFFL;
+    val = (y >= 0) ? (val >> shift) & 0xFFFFFFFFL : (val << shift) & 0xFFFFFFFFL;
+    return UInteger.valueOf(val);
+  }
+
+  /**
+   * Performs PostgresSQL-style bitwise shift on ULong.
+   * Overflow bits are masked to 64 bits (long shifts naturally truncate).
+   */
+  public static ULong rightShift(ULong x, long y) {
+    int shift = positiveModulo(y, 64);
+    long val = x.longValue();
+    // Use a logical (unsigned) right shift: ULong holds the full 64 bits, so
+    // the raw long may be negative and an arithmetic '>>' would sign-extend.
+    val = (y >= 0) ? val >>> shift : val << shift;
     return ULong.valueOf(val);
   }
 
@@ -4051,6 +4147,55 @@ public class SqlFunctions {
   public static BigDecimal mod(BigDecimal b0, BigDecimal b1) {
     final BigDecimal[] bigDecimals = b0.divideAndRemainder(b1);
     return bigDecimals[1];
+  }
+
+  // PERCENTILE_CONT / PERCENTILE_DISC
+
+  /** Support the PERCENTILE_CONT aggregate function.
+   *
+   * <p>The {@code values} list must already be sorted according to the
+   * {@code WITHIN GROUP (ORDER BY ...)} clause. The fraction must be in the
+   * range 0 to 1 inclusive. The result is a linear interpolation between the
+   * two values that surround the desired position. */
+  public static BigDecimal percentileCont(List<? extends Number> values,
+      double fraction) {
+    final int n = values.size();
+    if (n == 0) {
+      throw new NoSuchElementException(
+          "PERCENTILE_CONT is not defined on an empty group");
+    }
+    final double rank = fraction * (n - 1);
+    final int lo = (int) Math.floor(rank);
+    final int hi = (int) Math.ceil(rank);
+    final BigDecimal loValue = toBigDecimal(values.get(lo));
+    if (lo == hi) {
+      return loValue;
+    }
+    final BigDecimal hiValue = toBigDecimal(values.get(hi));
+    final BigDecimal frac = BigDecimal.valueOf(rank - lo);
+    return loValue.add(hiValue.subtract(loValue).multiply(frac));
+  }
+
+  /** Support the PERCENTILE_DISC aggregate function.
+   *
+   * <p>The {@code values} list must already be sorted according to the
+   * {@code WITHIN GROUP (ORDER BY ...)} clause. The fraction must be in the
+   * range 0 to 1 inclusive. The result is an actual value from the group: the
+   * first whose cumulative distribution is greater than or equal to the
+   * fraction. */
+  public static Object percentileDisc(List<?> values, double fraction) {
+    final int n = values.size();
+    if (n == 0) {
+      throw new NoSuchElementException(
+          "PERCENTILE_DISC is not defined on an empty group");
+    }
+    int index = (int) Math.ceil(fraction * n) - 1;
+    if (index < 0) {
+      index = 0;
+    } else if (index >= n) {
+      index = n - 1;
+    }
+    return requireNonNull(values.get(index));
   }
 
   // FLOOR

@@ -575,6 +575,10 @@ public class RelDecorrelator implements ReflectiveVisitor {
     // Its output does not change the input ordering, so there's no
     // need to call propagateExpr.
 
+    if (isCorVarDefined && !canDecorrelateOffsetFetch(rel)) {
+      return null;
+    }
+
     final RelNode oldInput = rel.getInput();
     final Frame frame = getInvoke(oldInput, isCorVarDefined, rel, true);
     if (frame == null) {
@@ -1137,8 +1141,31 @@ public class RelDecorrelator implements ReflectiveVisitor {
     return register(sort, result, mapOldToNewOutputs, corDefOutputs);
   }
 
+  static boolean canDecorrelateOffsetFetch(Sort sort) {
+    final @Nullable RexLiteral fetch = sort.fetch == null
+        ? null
+        : RexUtil.reduceFetchToLiteral(sort.getCluster(), sort.fetch);
+    return isNonNegativeIntegralLiteral(sort.offset)
+        && (sort.fetch == null
+            || fetch != null && isNonNegativeIntegralLiteral(fetch));
+  }
+
+  private static boolean isNonNegativeIntegralLiteral(@Nullable RexNode node) {
+    if (node == null) {
+      return true;
+    }
+    if (!(node instanceof RexLiteral)) {
+      return false;
+    }
+    final @Nullable BigDecimal value =
+        ((RexLiteral) node).getValueAs(BigDecimal.class);
+    return value != null
+        && value.signum() >= 0
+        && value.stripTrailingZeros().scale() <= 0;
+  }
+
   protected @Nullable Frame decorrelateSortAsAggregate(Sort sort, final Frame frame) {
-    if (sort.offset != null || sort.fetch == null) {
+    if (sort.offset != null || !(sort.fetch instanceof RexLiteral)) {
       return null;
     }
 
@@ -2047,12 +2074,18 @@ public class RelDecorrelator implements ReflectiveVisitor {
       joinConditions.add(originalCond);
     }
 
-    if (generatesNullsOnLeft || generatesNullsOnRight) {
-      List<RexNode> conds =
-          buildCorDefJoinConditions(leftCorDefOutputs, rightCorDefOutputs,
-              newLeftFrame.r, newRightFrame.r, relBuilder);
-      joinConditions.addAll(conds);
-    }
+    // Decorrelation propagates references to outer columns as columns in the
+    // rewritten inputs. If both join inputs propagate the same reference, add
+    // a condition to ensure that they still represent the same outer value.
+    // This applies to every join type, regardless of whether it generates nulls;
+    // if the inputs have no references in common, no condition is added.
+    joinConditions.addAll(
+        buildCorDefJoinConditions(
+            newLeftFrame.corDefOutputs,
+            newRightFrame.corDefOutputs,
+            newLeftFrame.r,
+            newRightFrame.r,
+            relBuilder));
 
     RexNode finalCondition = joinConditions.isEmpty()
         ? relBuilder.literal(true)

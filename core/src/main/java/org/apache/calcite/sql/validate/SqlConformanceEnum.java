@@ -103,6 +103,15 @@ public enum SqlConformanceEnum implements SqlConformance {
     }
   }
 
+  @Override public boolean allowWithinGroupOverAggregate() {
+    switch (this) {
+    case BABEL:
+      return true;
+    default:
+      return false;
+    }
+  }
+
   @Override public boolean isSupportedDualTable() {
     switch (this) {
     case MYSQL_5:
@@ -433,6 +442,17 @@ public enum SqlConformanceEnum implements SqlConformance {
     }
   }
 
+  @Override public boolean allowLambdaClosure() {
+    switch (this) {
+    case STRICT_92:
+    case STRICT_99:
+    case STRICT_2003:
+      return false;
+    default:
+      return true;
+    }
+  }
+
   @Override public boolean allowAliasUnnestItems() {
     switch (this) {
     case BIG_QUERY:
@@ -534,6 +554,16 @@ public enum SqlConformanceEnum implements SqlConformance {
   }
 
   @Override public boolean isDistinctOnAllowed() {
+    switch (this) {
+    case BABEL:
+    case LENIENT:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  @Override public boolean isCorrelatedAggregateAllowed() {
     switch (this) {
     case BABEL:
     case LENIENT:

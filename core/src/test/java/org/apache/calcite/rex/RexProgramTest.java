@@ -48,6 +48,7 @@ import org.apache.calcite.util.TimestampString;
 import org.apache.calcite.util.TimestampWithTimeZoneString;
 import org.apache.calcite.util.Util;
 
+import com.google.common.collect.Collections2;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableRangeSet;
@@ -67,6 +68,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 
 import static org.apache.calcite.test.Matchers.isRangeSet;
@@ -81,6 +83,7 @@ import static org.hamcrest.Matchers.hasToString;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import static java.util.Objects.requireNonNull;
@@ -508,6 +511,45 @@ class RexProgramTest extends RexProgramTestBase {
         and(vBool(), not(vBool()),
             vBoolNotNull(1), not(vBoolNotNull(1))),
         "false");
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7657">[CALCITE-7657]
+   * Apply the absorption law to simplify boolean expressions</a>. */
+  @Test void testAbsorptionLaw() {
+    // AND absorption: a AND (a OR b) => a
+    checkSimplify(and(vBool(), or(vBool(), vBool(1))), "?0.bool0");
+    checkSimplify(and(or(vBool(), vBool(1)), vBool()), "?0.bool0");
+
+    // OR absorption: a OR (a AND b) => a
+    checkSimplify(or(vBool(), and(vBool(), vBool(1))), "?0.bool0");
+    checkSimplify(or(and(vBool(), vBool(1)), vBool()), "?0.bool0");
+
+    // with not-null booleans
+    checkSimplify(and(vBoolNotNull(), or(vBoolNotNull(), vBoolNotNull(1))), "?0.notNullBool0");
+    checkSimplify(or(vBoolNotNull(), and(vBoolNotNull(), vBoolNotNull(1))), "?0.notNullBool0");
+
+    // filter mode (unknownAsFalse)
+    checkSimplifyFilter(and(vBool(), or(vBool(), vBool(1))), "?0.bool0");
+    checkSimplifyFilter(or(vBool(), and(vBool(), vBool(1))), "?0.bool0");
+  }
+
+  @Test void testAbsorptionLawWithNonDeterministic() {
+    // a is a non-deterministic boolean ("NDC()")
+    final SqlOperator ndc = getNoDeterministicOperator();
+    final RexNode a = rexBuilder.makeCall(ndc);
+    final RexNode b = gt(vInt(1), literal(1));
+
+    // a AND (a OR b) must NOT be simplified to a
+    checkSimplifyUnchanged(and(a, or(a, b)));
+    // a OR (a AND b) must NOT be simplified to a
+    checkSimplifyUnchanged(or(a, and(a, b)));
+
+    // Sanity check: when a is deterministic, absorption does apply.
+    final SqlOperator dc = getDeterministicOperator();
+    final RexNode da = rexBuilder.makeCall(dc);
+    checkSimplify(and(da, or(da, b)), "DC()");
+    checkSimplify(or(da, and(da, b)), "DC()");
   }
 
   @Disabled("CALCITE-3457: AssertionError in RexSimplify.validateStrongPolicy")
@@ -2285,6 +2327,33 @@ class RexProgramTest extends RexProgramTestBase {
   }
 
   /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7635">[CALCITE-7635]
+   * Simplification result of conjunction of comparisons depends on terms order</a>. */
+  @Test void testSimplifyAndComparison() {
+    List<RexNode> args =
+        ImmutableList.of(lt(vInt(), literal(10)),
+        gt(vInt(), literal(0)),
+        lt(vInt(), literal(20)));
+    for (List<RexNode> params : Collections2.permutations(args)) {
+      checkSimplifyFilter(
+          and(params),
+          "SEARCH(?0.int0, Sarg[(0..10)])");
+    }
+  }
+
+  @Test void testSimplifyComparisonWithPredicates() {
+    RelOptPredicateList relOptPredicateList =
+        RelOptPredicateList.of(rexBuilder,
+            ImmutableList.of(lt(vInt(), literal(10)), gt(vInt(), literal(0))));
+    checkSimplifyWithPredicates(lt(vInt(), literal(20)), relOptPredicateList,
+        RexUnknownAs.UNKNOWN, "IS NOT NULL(?0.int0)");
+    checkSimplifyWithPredicates(lt(vInt(), literal(20)), relOptPredicateList,
+        RexUnknownAs.FALSE, "true");
+    checkSimplifyWithPredicates(lt(vInt(), literal(20)), relOptPredicateList,
+        RexUnknownAs.TRUE, "true");
+  }
+
+  /** Test case for
    * <a href="https://issues.apache.org/jira/browse/CALCITE-7160">[CALCITE-7160]
    * Simplify AND/OR with DISTINCT predicates to SEARCH</a>. */
   @Test void testSimplifyAndIsDistinctFrom() {
@@ -3034,10 +3103,9 @@ class RexProgramTest extends RexProgramTestBase {
     // ==>
     // "A IS NOT NULL"
     SqlOperator dc = getDeterministicOperator();
-    checkSimplify2(
+    checkSimplify(
         and(or(isNotNull(rexBuilder.makeCall(dc)), gt(vInt(2), literal(2))),
             isNotNull(rexBuilder.makeCall(dc))),
-        "AND(OR(IS NOT NULL(DC()), >(?0.int2, 2)), IS NOT NULL(DC()))",
         "IS NOT NULL(DC())");
   }
 
@@ -3564,6 +3632,35 @@ class RexProgramTest extends RexProgramTestBase {
         hasSize(0));
   }
 
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testContainsDynamicParam() {
+    final RelDataType intType = typeFactory.createSqlType(SqlTypeName.INTEGER);
+    final RexNode literal = rexBuilder.makeExactLiteral(BigDecimal.ONE, intType);
+    final RexNode dynamicParam = rexBuilder.makeDynamicParam(intType, 0);
+    final RexNode expression =
+        rexBuilder.makeCall(SqlStdOperatorTable.PLUS, literal, dynamicParam);
+
+    assertThat(RexUtil.containsDynamicParam(literal), is(false));
+    assertThat(RexUtil.containsDynamicParam(dynamicParam), is(true));
+    assertThat(RexUtil.containsDynamicParam(expression), is(true));
+  }
+
+  /** Test case for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7592">[CALCITE-7592]
+   * Add expression support for FETCH</a>. */
+  @Test void testValidateFetchValueAllowsFractionalBigDecimal() {
+    assertThat(RexUtil.validateFetchValue(new BigDecimal("1.5")),
+        is(new BigDecimal("1.5")));
+
+    final IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class,
+            () -> RexUtil.validateFetchValue(new BigDecimal("-1.5")));
+    assertThat(e.getMessage(),
+        containsString("FETCH value -1.5 is out of range"));
+  }
+
   @Test void testConstantMap() {
     final RelDataType intType = typeFactory.createSqlType(SqlTypeName.INTEGER);
     final RelDataType bigintType = typeFactory.createSqlType(SqlTypeName.BIGINT);
@@ -3841,6 +3938,33 @@ class RexProgramTest extends RexProgramTestBase {
     assertThat(result2.getOperands().get(0), is(booleanInput));
   }
 
+  /** Test cases for <a href="https://issues.apache.org/jira/browse/CALCITE-7619">[CALCITE-7619]
+   * RexSimplify incorrectly simplifies IS_FALSE(x) when x is nullable</a>. */
+  @Test void testSimplifyPreservingTypeIsNotNullCast() {
+    // IS_FALSE(nullable_bool) has type BOOLEAN NOT NULL.
+    final RexNode isFalseExpr = isFalse(vBool());
+    assertThat("IS_FALSE has NOT NULL type", isFalseExpr.getType().isNullable(), is(false));
+    final RexNode s0 = simplify.simplifyPreservingType(isFalseExpr, RexUnknownAs.FALSE, true);
+    // nullable_bool IS FALSE != CAST(NOT(nullable_bool) AS BOOL NOT NULL)
+    assertThat(s0.isA(SqlKind.CAST), is(false));
+
+    // simplify(IS_FALSE(nullable_bool), FALSE) = NOT(nullable_bool), which is nullable.
+    final RexNode s1 = simplify.simplify(isFalseExpr, RexUnknownAs.FALSE);
+    assertThat(s1.isA(SqlKind.NOT), is(true));
+    assertThat(s1.getType().isNullable(), is(true));
+
+    // IS_TRUE(nullable_bool) has type BOOLEAN NOT NULL.
+    final RexNode isTrueExpr = isTrue(vBool());
+    assertThat(isTrueExpr.getType().isNullable(), is(false));
+    final RexNode s2 = simplify.simplifyPreservingType(isTrueExpr, RexUnknownAs.FALSE, true);
+    // nullable_bool IS TRUE != CAST(nullable_bool AS BOOL NOT NULL)
+    assertThat(s2.isA(SqlKind.CAST), is(false));
+
+    // simplify(IS_TRUE(nullable_bool), FALSE) = nullable_bool, which is nullable.
+    final RexNode s3 = simplify.simplify(isTrueExpr, RexUnknownAs.FALSE);
+    assertThat(s3.getType().isNullable(), is(true));
+  }
+
   @Test void testSimplifyNot() {
     // "NOT(NOT(x))" => "x"
     checkSimplify(not(not(vBool())), "?0.bool0");
@@ -3876,7 +4000,7 @@ class RexProgramTest extends RexProgramTestBase {
     //    -> "x = x AND y < y" (treating unknown as unknown)
     //    -> false (treating unknown as false)
     checkSimplify3(and(eq(vInt(1), vInt(1)), not(ge(vInt(2), vInt(2)))),
-        "AND(OR(null, IS NOT NULL(?0.int1)), null, IS NULL(?0.int2))",
+        "AND(null, IS NULL(?0.int2))",
         "false",
         "IS NULL(?0.int2)");
 
@@ -3884,7 +4008,7 @@ class RexProgramTest extends RexProgramTestBase {
     //   -> "OR(x <> x, y >= y)" (treating unknown as unknown)
     //   -> "y IS NOT NULL" (treating unknown as false)
     checkSimplify3(not(and(eq(vInt(1), vInt(1)), not(ge(vInt(2), vInt(2))))),
-        "OR(AND(null, IS NULL(?0.int1)), null, IS NOT NULL(?0.int2))",
+        "OR(null, IS NOT NULL(?0.int2))",
         "IS NOT NULL(?0.int2)",
         "true");
   }
@@ -3942,7 +4066,7 @@ class RexProgramTest extends RexProgramTestBase {
     //   -> "AND(x <> x, y >= y)" (treating unknown as unknown)
     //   -> "FALSE" (treating unknown as false)
     checkSimplify3(not(or(eq(vInt(1), vInt(1)), not(ge(vInt(2), vInt(2))))),
-        "AND(null, IS NULL(?0.int1), OR(null, IS NOT NULL(?0.int2)))",
+        "AND(null, IS NULL(?0.int1))",
         "false",
         "IS NULL(?0.int1)");
   }
@@ -4069,6 +4193,31 @@ class RexProgramTest extends RexProgramTestBase {
                 .add(Range.greaterThan(new BigDecimal("1.00000000000")))
                 .build());
     assertThat(sarg.isComplementedPoints(), is(true));
+  }
+
+  /** Unit test for
+   * <a href="https://issues.apache.org/jira/browse/CALCITE-7555">[CALCITE-7555]
+   * {@code Sarg.compareTo} collapses semantically different search arguments
+   * that have different {@code nullAs}</a>.
+   *
+   * <p>{@link Sarg#equals} and {@link Sarg#hashCode} account for
+   * {@link Sarg#nullAs}, but {@link Sarg#compareTo} used to order only by the
+   * range set, so two Sargs over the same ranges but with different null
+   * semantics were unequal yet compared as {@code 0}. A sorted collection keyed
+   * on Sarg would then silently drop one of them. */
+  @Test void testSargCompareToIsConsistentWithEquals() {
+    final ImmutableRangeSet<Integer> singleton =
+        ImmutableRangeSet.of(Range.singleton(1));
+    final Sarg<Integer> unknown = Sarg.of(RexUnknownAs.UNKNOWN, singleton);
+    final Sarg<Integer> falseSarg = Sarg.of(RexUnknownAs.FALSE, singleton);
+
+    assertFalse(unknown.equals(falseSarg));
+    assertThat(unknown.compareTo(falseSarg) == 0, is(false));
+
+    final TreeSet<Sarg<Integer>> values = new TreeSet<>();
+    values.add(unknown);
+    values.add(falseSarg);
+    assertThat(values, hasSize(2));
   }
 
   @Test void testInterpreter() {
@@ -4348,7 +4497,7 @@ class RexProgramTest extends RexProgramTestBase {
     checkSimplifyFilter(ne(refNullable, literal(9)), relOptPredicateList,
         "false");
     checkSimplifyFilter(ne(refNullable, literal(5)), relOptPredicateList,
-        "IS NOT NULL($0)");
+        "true");
   }
 
   /** Tests

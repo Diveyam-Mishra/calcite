@@ -377,6 +377,7 @@ import static org.apache.calcite.sql.fun.SqlStdOperatorTable.BITXOR_OPERATOR;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.BIT_AND;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.BIT_LEFT_SHIFT;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.BIT_OR;
+import static org.apache.calcite.sql.fun.SqlStdOperatorTable.BIT_RIGHT_SHIFT;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.BIT_XOR;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.CARDINALITY;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.CAST;
@@ -499,6 +500,8 @@ import static org.apache.calcite.sql.fun.SqlStdOperatorTable.NTILE;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.OCTET_LENGTH;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.OR;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.OVERLAY;
+import static org.apache.calcite.sql.fun.SqlStdOperatorTable.PERCENTILE_CONT;
+import static org.apache.calcite.sql.fun.SqlStdOperatorTable.PERCENTILE_DISC;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.PI;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.PLUS;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.POSITION;
@@ -512,6 +515,7 @@ import static org.apache.calcite.sql.fun.SqlStdOperatorTable.RANK;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.REGR_COUNT;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.REINTERPRET;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.REPLACE;
+import static org.apache.calcite.sql.fun.SqlStdOperatorTable.RIGHTSHIFT;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.ROUND;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.ROW;
 import static org.apache.calcite.sql.fun.SqlStdOperatorTable.ROW_NUMBER;
@@ -557,7 +561,7 @@ import static java.util.Objects.requireNonNull;
  *
  * <p>Immutable.
  */
-public class RexImpTable {
+public class RexImpTable implements RexImplementorTable {
   /** The singleton instance. */
   public static final RexImpTable INSTANCE;
 
@@ -567,6 +571,11 @@ public class RexImpTable {
     builder.populate2();
     builder.populate3();
     INSTANCE = new RexImpTable(builder);
+  }
+
+  /** Returns the table of built-in implementors. */
+  public static RexImplementorTable instance() {
+    return INSTANCE;
   }
 
   public static final ConstantExpression NULL_EXPR =
@@ -914,6 +923,18 @@ public class RexImpTable {
       // BIT_LEFT_SHIFT: Operator syntax for bitwise left shift in SQL expressions
       // (e.g., x << y)
       defineMethod(BIT_LEFT_SHIFT, BuiltInMethod.LEFT_SHIFT.method, NullPolicy.STRICT);
+
+      // Right shift operations: shift bits to the right by specified amount.
+      // Supports integer and unsigned integer data types. Binary right shift is
+      // intentionally not supported; see [CALCITE-7651].
+      // Shift amount is normalized using modulo arithmetic based on data type bit width.
+
+      // RIGHTSHIFT: Function call syntax for bitwise right shift operation (e.g., RIGHTSHIFT(x, y))
+      defineMethod(RIGHTSHIFT, BuiltInMethod.RIGHT_SHIFT.method, NullPolicy.STRICT);
+
+      // BIT_RIGHT_SHIFT: Operator syntax for bitwise right shift in SQL expressions
+      // (e.g., x >> y)
+      defineMethod(BIT_RIGHT_SHIFT, BuiltInMethod.RIGHT_SHIFT.method, NullPolicy.STRICT);
 
       define(SAFE_ADD,
           new SafeArithmeticImplementor(BuiltInMethod.SAFE_ADD.method));
@@ -1321,6 +1342,8 @@ public class RexImpTable {
       defineAgg(SINGLE_VALUE, SingleValueImplementor.class);
       defineAgg(COLLECT, CollectImplementor.class);
       defineAgg(ARRAY_AGG, CollectImplementor.class);
+      defineAgg(PERCENTILE_CONT, PercentileImplementor.class);
+      defineAgg(PERCENTILE_DISC, PercentileImplementor.class);
       defineAgg(LISTAGG, ListaggImplementor.class);
       defineAgg(FUSION, FusionImplementor.class);
       defineAgg(MODE, ModeImplementor.class);
@@ -1457,7 +1480,9 @@ public class RexImpTable {
     };
   }
 
-  private static RexCallImplementor wrapAsRexCallImplementor(
+  /** Wraps a {@link CallImplementor} (for example, one built with
+   * {@link #createImplementor}) as a {@link RexCallImplementor}. */
+  public static RexCallImplementor wrapAsRexCallImplementor(
       final CallImplementor implementor) {
     return new AbstractRexCallImplementor("udf", NullPolicy.NONE, false) {
       @Override Expression implementSafe(RexToLixTranslator translator,
@@ -1467,7 +1492,7 @@ public class RexImpTable {
     };
   }
 
-  public @Nullable RexCallImplementor get(final SqlOperator operator) {
+  @Override public @Nullable RexCallImplementor get(final SqlOperator operator) {
     if (operator instanceof SqlUserDefinedFunction) {
       org.apache.calcite.schema.Function udf =
           ((SqlUserDefinedFunction) operator).getFunction();
@@ -1502,7 +1527,7 @@ public class RexImpTable {
     return null;
   }
 
-  public @Nullable AggImplementor get(final SqlAggFunction aggregation,
+  @Override public @Nullable AggImplementor get(final SqlAggFunction aggregation,
       boolean forWindowAggregate) {
     if (aggregation instanceof SqlUserDefinedAggFunction) {
       final SqlUserDefinedAggFunction udaf =
@@ -1531,24 +1556,18 @@ public class RexImpTable {
     return aggSupplier.get();
   }
 
-  public MatchImplementor get(final SqlMatchFunction function) {
+  @Override public @Nullable MatchImplementor get(
+      final SqlMatchFunction function) {
     final Supplier<? extends MatchImplementor> supplier =
         matchMap.get(function);
-    if (supplier != null) {
-      return supplier.get();
-    } else {
-      throw new IllegalStateException("Supplier should not be null");
-    }
+    return supplier != null ? supplier.get() : null;
   }
 
-  public TableFunctionCallImplementor get(final SqlWindowTableFunction operator) {
+  @Override public @Nullable TableFunctionCallImplementor get(
+      final SqlWindowTableFunction operator) {
     final Supplier<? extends TableFunctionCallImplementor> supplier =
         tvfImplementorMap.get(operator);
-    if (supplier != null) {
-      return supplier.get();
-    } else {
-      throw new IllegalStateException("Supplier should not be null");
-    }
+    return supplier != null ? supplier.get() : null;
   }
 
   static Expression optimize(Expression expression) {
@@ -1963,6 +1982,60 @@ public class RexImpTable {
               Expressions.call(add.accumulator().get(0),
                   BuiltInMethod.COLLECTION_ADD.method,
                   add.arguments().get(0))));
+    }
+  }
+
+  /** Implementor for the {@code PERCENTILE_CONT} and {@code PERCENTILE_DISC}
+   * aggregate functions.
+   *
+   * <p>The fraction is the sole argument of the aggregate call, while the
+   * values whose percentile is computed come from the
+   * {@code WITHIN GROUP (ORDER BY ...)} column, which
+   * {@link EnumerableAggregateBase#createAccumulatorAdders} exposes as an extra
+   * argument. The input rows are sorted by {@code SourceSorter} before being
+   * accumulated, so the collected values are already in order. */
+  static class PercentileImplementor extends StrictAggImplementor {
+    @Override public List<Type> getNotNullState(AggContext info) {
+      final List<Type> types = new ArrayList<>();
+      types.add(List.class);
+      types.add(double.class);
+      return types;
+    }
+
+    @Override protected void implementNotNullReset(AggContext info,
+        AggResetContext reset) {
+      reset.currentBlock().add(
+          Expressions.statement(
+              Expressions.assign(reset.accumulator().get(0),
+                  Expressions.new_(ArrayList.class))));
+      reset.currentBlock().add(
+          Expressions.statement(
+              Expressions.assign(reset.accumulator().get(1),
+                  Expressions.constant(0d))));
+    }
+
+    @Override protected void implementNotNullAdd(AggContext info,
+        AggAddContext add) {
+      add.currentBlock().add(
+          Expressions.statement(
+              Expressions.assign(add.accumulator().get(1),
+                  EnumUtils.convert(add.arguments().get(0), double.class))));
+
+      add.currentBlock().add(
+          Expressions.statement(
+              Expressions.call(add.accumulator().get(0),
+                  BuiltInMethod.COLLECTION_ADD.method,
+                  Expressions.box(add.arguments().get(1)))));
+    }
+
+    @Override protected Expression implementNotNullResult(AggContext info,
+        AggResultContext result) {
+      final BuiltInMethod method =
+          info.aggregation().kind == SqlKind.PERCENTILE_DISC
+              ? BuiltInMethod.PERCENTILE_DISC
+              : BuiltInMethod.PERCENTILE_CONT;
+      return Expressions.call(method.method, result.accumulator().get(0),
+          result.accumulator().get(1));
     }
   }
 

@@ -90,6 +90,24 @@ public interface SqlConformance {
   boolean allowCharLiteralAlias();
 
   /**
+   * Whether to allow an inverse distribution function such as
+   * {@code PERCENTILE_CONT} or {@code PERCENTILE_DISC} to combine a
+   * {@code WITHIN GROUP (ORDER BY ...)} clause with an {@code OVER} clause, so
+   * that it may be used as an analytic (window) function. For example,
+   *
+   * <blockquote><pre>
+   *   PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)
+   *     OVER (PARTITION BY y)</pre></blockquote>
+   *
+   * <p>This is non-standard SQL supported by Oracle.
+   *
+   * <p>Among the built-in conformance levels, true in
+   * {@link SqlConformanceEnum#BABEL};
+   * false otherwise.
+   */
+  boolean allowWithinGroupOverAggregate();
+
+  /**
    * Whether to allow aliases from the {@code SELECT} clause to be used as
    * column names in the {@code GROUP BY} clause.
    *
@@ -612,6 +630,28 @@ public interface SqlConformance {
   boolean allowQualifyingCommonColumn();
 
   /**
+   * Whether to allow lambda expressions to access variables from enclosing
+   * scopes (closure semantics).
+   *
+   * <p>For example, in a higher-order function context like:
+   *
+   * <blockquote><pre>
+   * SELECT *
+   * FROM t1
+   * JOIN t2 ON EXISTS(t1.arr, x -&gt; x = t2.v)</pre></blockquote>
+   *
+   * <p>The {@code t2.v} from the enclosing scope would be accessible inside
+   * the lambda body if closures are allowed.
+   *
+   * <p>Among the built-in conformance levels, false in
+   * {@link SqlConformanceEnum#STRICT_92},
+   * {@link SqlConformanceEnum#STRICT_99},
+   * {@link SqlConformanceEnum#STRICT_2003};
+   * true otherwise.
+   */
+  boolean allowLambdaClosure();
+
+  /**
    * Whether {@code VALUE} is allowed as an alternative to {@code VALUES} in
    * the parser.
    *
@@ -691,4 +731,20 @@ public interface SqlConformance {
    * false otherwise.
    */
   boolean isDistinctOnAllowed();
+
+  /**
+   * Whether an aggregate function inside a scalar sub-query is allowed to
+   * reference columns from an outer query.
+   *
+   * <p>This is not allowed by the SQL standard, but is supported by some
+   * databases, including SQLite, DuckDB and SQL Server.
+   *
+   * <p>Among the built-in conformance levels, true in
+   * {@link SqlConformanceEnum#BABEL},
+   * {@link SqlConformanceEnum#LENIENT};
+   * false otherwise.
+   */
+  default boolean isCorrelatedAggregateAllowed() {
+    return false;
+  }
 }

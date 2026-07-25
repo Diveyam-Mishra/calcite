@@ -279,6 +279,24 @@ public class ${parser.class} extends SqlAbstractParserImpl
             Span.of(table, extendList).pos(), table, extendList);
     }
 
+    /**
+     * Returns the parser position of the given token.
+     *
+     * <p>Declared as a plain method (rather than JAVACODE) so it can be called
+     * from generated lookahead code, which does not declare
+     * {@code throws ParseException}.
+     *
+     * @param token token whose position to return
+     * @return parser position spanning the given token
+     */
+    private static SqlParserPos pos(Token token) {
+        return new SqlParserPos(
+            token.beginLine,
+            token.beginColumn,
+            token.endLine,
+            token.endColumn);
+    }
+
     /** Adds a warning that a token such as "HOURS" was used,
     * whereas the SQL standard only allows "HOUR".
     *
@@ -691,7 +709,7 @@ SqlNode ExprOrJoinOrOrderedQuery(ExprContext exprContext) :
  *
  * <blockquote><pre>
  *    [ OFFSET start { ROW | ROWS } ]
- *    [ FETCH { FIRST | NEXT } [ count ] { ROW | ROWS } ONLY ]</pre>
+ *    [ FETCH { FIRST | NEXT } [ count | (expression) ] { ROW | ROWS } ONLY ]</pre>
  * </blockquote>
  */
 SqlNode OrderedQueryOrExpr(ExprContext exprContext) :
@@ -778,8 +796,24 @@ void FetchClause(SqlNode[] offsetFetch) :
 {
     // SQL:2008-style syntax. "OFFSET ... FETCH ...".
     // If you specify both LIMIT and FETCH, FETCH wins.
-    <FETCH> ( <FIRST> | <NEXT> ) offsetFetch[1] = UnsignedNumericLiteralOrParam()
+    <FETCH> ( <FIRST> | <NEXT> ) offsetFetch[1] = FetchCount()
     ( <ROW> | <ROWS> ) <ONLY>
+}
+
+/**
+ * Parses the row count of a FETCH clause. Expressions must be parenthesized.
+ */
+SqlNode FetchCount() :
+{
+    final SqlNode e;
+}
+{
+    (
+        e = UnsignedNumericLiteralOrParam()
+    |
+        <LPAREN> e = Expression(ExprContext.ACCEPT_NON_QUERY) <RPAREN>
+    )
+    { return e; }
 }
 
 /**
@@ -1296,6 +1330,8 @@ void AddKeyValueOption(List<SqlNode> list) :
     )
     <EQ>
     (
+        value = NumericLiteral()
+    |
         value = StringLiteral()
     |
         value = SimpleIdentifier()
@@ -1726,7 +1762,8 @@ SqlNode PartitionedQueryOrQueryOrExpr(ExprContext exprContext) :
     SqlNode e;
 }
 {
-    e = OrderedQueryOrExpr(exprContext)
+    // QueryOrExpr, not OrderedQueryOrExpr: ORDER BY is handled by PartitionedByAndOrderBy below.
+    e = QueryOrExpr(exprContext)
     e = PartitionedByAndOrderBy(e)
 
     { return e; }
@@ -3093,6 +3130,7 @@ SqlNodeList OrderBy(boolean accept) :
 {
     final List<SqlNode> list = new ArrayList<SqlNode>();
     final Span s;
+    SqlNode all;
 }
 {
     <ORDER> {
@@ -3104,10 +3142,32 @@ SqlNodeList OrderBy(boolean accept) :
             throw SqlUtil.newContextException(s.pos(), RESOURCE.illegalOrderBy());
         }
     }
-    <BY> OrderItemList(list)
-    {
-        return new SqlNodeList(list, s.addAll(list).pos());
-    }
+    <BY>
+    (
+        <ALL> { all = SqlInternalOperators.ORDER_BY_ALL.createCall(getPos()); }
+        (
+            <ASC>
+        |   <DESC> { all = SqlStdOperatorTable.DESC.createCall(getPos(), all); }
+        )?
+        (
+            LOOKAHEAD(2)
+            <NULLS> <FIRST> {
+                all = SqlStdOperatorTable.NULLS_FIRST.createCall(getPos(), all);
+            }
+        |
+            <NULLS> <LAST> {
+                all = SqlStdOperatorTable.NULLS_LAST.createCall(getPos(), all);
+            }
+        )?
+        {
+            list.add(all);
+            return new SqlNodeList(list, s.addAll(list).pos());
+        }
+    |
+        OrderItemList(list) {
+            return new SqlNodeList(list, s.addAll(list).pos());
+        }
+    )
 }
 
 <#if parser.includeSelectBy!false>
@@ -8445,6 +8505,17 @@ SqlBinaryOperator BinaryRowOperator() :
     // <IN> is handled as a special case
     <EQ> { return SqlStdOperatorTable.EQUALS; }
 |   <LEFTSHIFT> { return SqlStdOperatorTable.BIT_LEFT_SHIFT; }
+    // The right shift operator ">>" is matched as two ">" tokens rather than a
+    // single ">>" token. A greedy ">>" token would be produced by the lexer even
+    // when the two ">" characters close nested angle-bracket types (e.g.
+    // MAP<INT, MAP<INT, INT>>), breaking type parsing. Matching two ">" tokens here
+    // keeps right shift confined to expression context. The semantic lookahead
+    // requires the two ">" to be immediately adjacent (no intervening whitespace),
+    // so "a > > b" is not treated as a right shift; otherwise we fall through to
+    // the single ">" (greater-than) alternative below.
+|   LOOKAHEAD({ getToken(1).kind == GT && getToken(2).kind == GT
+        && pos(getToken(1)).endsImmediatelyBefore(pos(getToken(2))) })
+    <GT> <GT> { return SqlStdOperatorTable.BIT_RIGHT_SHIFT; }
 |   <GT> { return SqlStdOperatorTable.GREATER_THAN; }
 |   <LT> { return SqlStdOperatorTable.LESS_THAN; }
 |   <LE> { return SqlStdOperatorTable.LESS_THAN_OR_EQUAL; }

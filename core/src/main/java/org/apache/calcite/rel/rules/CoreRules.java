@@ -654,6 +654,11 @@ public class CoreRules {
   public static final JoinExtractFilterRule JOIN_EXTRACT_FILTER =
       JoinExtractFilterRule.Config.DEFAULT.toRule();
 
+  /** Rule that pulls an {@link Aggregate} from the left input of a
+   * {@link Join} to above the join (group-by pull up). */
+  public static final JoinAggregateTransposeRule JOIN_AGGREGATE_TRANSPOSE =
+      JoinAggregateTransposeRule.Config.DEFAULT.toRule();
+
   /** Rule that matches a {@link LogicalJoin} whose inputs are
    * {@link LogicalProject}s, and pulls the project expressions up. */
   public static final JoinProjectTransposeRule JOIN_PROJECT_BOTH_TRANSPOSE =
@@ -984,6 +989,11 @@ public class CoreRules {
    *  into equivalent {@link Union} ALL of GROUP BY operations. */
   public static final AggregateGroupingSetsToUnionRule AGGREGATE_GROUPING_SETS_TO_UNION =
       AggregateGroupingSetsToUnionRule.Config.DEFAULT.toRule();
+
+  /** Rule that removes {@code LITERAL_AGG} aggregate calls by replacing them
+   * with literal expressions in a {@link Project}. */
+  public static final AggregateRemoveLiteralAggRule AGGREGATE_REMOVE_LITERAL_AGG =
+      AggregateRemoveLiteralAggRule.Config.DEFAULT.toRule();
 
   /** Rule that converts a {@link Correlate} after an {@link Uncollect} into a simple
    * Uncollect, if possible. */

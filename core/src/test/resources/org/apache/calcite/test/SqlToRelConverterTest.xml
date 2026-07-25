@@ -98,10 +98,10 @@ from empnullables]]>
     <Resource name="plan">
       <![CDATA[
 LogicalAggregate(group=[{}], EXPR$0=[COUNT() FILTER $0])
-  LogicalProject($f0=[CAST(IN($0, {
+  LogicalProject($f0=[IS TRUE(IN($0, {
 LogicalProject(DEPTNO=[$7])
   LogicalTableScan(table=[[CATALOG, SALES, EMPNULLABLES]])
-})):BOOLEAN NOT NULL])
+}))])
     LogicalTableScan(table=[[CATALOG, SALES, EMPNULLABLES]])
 ]]>
     </Resource>
@@ -328,6 +328,20 @@ LogicalProject(A=[$0], B=[$1], C=[$2], DEPTNO=[$3], NAME=[$4])
 ]]>
     </Resource>
   </TestCase>
+  <TestCase name="testAliasUnnestArrayLiteralPlanWithoutColumnList">
+    <Resource name="sql">
+      <![CDATA[select t
+from UNNEST(ARRAY[1, 2, 3]) as t]]>
+    </Resource>
+    <Resource name="plan">
+      <![CDATA[
+LogicalProject(T=[$0])
+  Uncollect
+    LogicalProject(EXPR$0=[ARRAY(1, 2, 3)])
+      LogicalValues(tuples=[[{ 0 }]])
+]]>
+    </Resource>
+  </TestCase>
   <TestCase name="testAliasUnnestArrayPlanWithDoubleColumn">
     <Resource name="plan">
       <![CDATA[
@@ -394,6 +408,40 @@ LogicalProject(DEPTNO=[$0], EMPNO=[$5.EMPNO])
       <![CDATA[select d.deptno, employee.empno
 from dept_nested_expanded as d,
  UNNEST(d.employees) as t(employee)]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testAliasUnnestArrayPlanWithoutColumnList">
+    <Resource name="sql">
+      <![CDATA[select d.deptno, e.empno
+from dept_nested_expanded as d,
+ UNNEST(d.employees) as e]]>
+    </Resource>
+    <Resource name="plan">
+      <![CDATA[
+LogicalProject(DEPTNO=[$0], EMPNO=[$5.EMPNO])
+  LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{2}])
+    LogicalTableScan(table=[[CATALOG, SALES, DEPT_NESTED_EXPANDED]])
+    Uncollect
+      LogicalProject(EMPLOYEES=[$cor0.EMPLOYEES])
+        LogicalValues(tuples=[[{ 0 }]])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testAliasUnnestScalarArrayPlanWithoutColumnList">
+    <Resource name="sql">
+      <![CDATA[select d.deptno, a
+from dept_nested_expanded as d,
+ UNNEST(d.admins) as a]]>
+    </Resource>
+    <Resource name="plan">
+      <![CDATA[
+LogicalProject(DEPTNO=[$0], A=[$5])
+  LogicalCorrelate(correlation=[$cor0], joinType=[inner], requiredColumns=[{3}])
+    LogicalTableScan(table=[[CATALOG, SALES, DEPT_NESTED_EXPANDED]])
+    Uncollect
+      LogicalProject(ADMINS=[$cor0.ADMINS])
+        LogicalValues(tuples=[[{ 0 }]])
+]]>
     </Resource>
   </TestCase>
   <TestCase name="testAliasWithinGroupingSets">
@@ -850,6 +898,38 @@ LogicalProject(NAME=[$0])
       LogicalTableScan(table=[[CATALOG, SALES, EMP]])
     LogicalProject(NAME=[$1])
       LogicalTableScan(table=[[CATALOG, SALES, DEPT]])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testCollectionTableWithCursorParamUnion">
+    <Resource name="sql">
+      <![CDATA[select * from table(dedup(cursor(select ename from emp union all select ename from emp), 'NAME'))]]>
+    </Resource>
+    <Resource name="plan">
+      <![CDATA[
+LogicalProject(NAME=[$0])
+  LogicalTableFunctionScan(invocation=[DEDUP(CAST($0):CURSOR NOT NULL, 'NAME')], rowType=[RecordType(VARCHAR(1024) NAME)])
+    LogicalUnion(all=[true])
+      LogicalProject(ENAME=[$1])
+        LogicalTableScan(table=[[CATALOG, SALES, EMP]])
+      LogicalProject(ENAME=[$1])
+        LogicalTableScan(table=[[CATALOG, SALES, EMP]])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testCollectionTableWithCursorParamUnionDistinct">
+    <Resource name="sql">
+      <![CDATA[select * from table(dedup(cursor(select ename from emp union select ename from emp), 'NAME'))]]>
+    </Resource>
+    <Resource name="plan">
+      <![CDATA[
+LogicalProject(NAME=[$0])
+  LogicalTableFunctionScan(invocation=[DEDUP(CAST($0):CURSOR NOT NULL, 'NAME')], rowType=[RecordType(VARCHAR(1024) NAME)])
+    LogicalUnion(all=[false])
+      LogicalProject(ENAME=[$1])
+        LogicalTableScan(table=[[CATALOG, SALES, EMP]])
+      LogicalProject(ENAME=[$1])
+        LogicalTableScan(table=[[CATALOG, SALES, EMP]])
 ]]>
     </Resource>
   </TestCase>
@@ -2519,6 +2599,18 @@ LogicalSort(fetch=[5])
     <Resource name="plan">
       <![CDATA[
 LogicalSort(fetch=[?0])
+  LogicalProject(EMPNO=[$0])
+    LogicalTableScan(table=[[CATALOG, SALES, EMP]])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testFetchWithExpression">
+    <Resource name="sql">
+      <![CDATA[select empno from emp fetch next (1 + abs(-2)) rows only]]>
+    </Resource>
+    <Resource name="plan">
+      <![CDATA[
+LogicalSort(fetch=[+(1, ABS(-2))])
   LogicalProject(EMPNO=[$0])
     LogicalTableScan(table=[[CATALOG, SALES, EMP]])
 ]]>
@@ -5517,7 +5609,7 @@ values(t.empno, t.ename, 10, t.sal * .15)]]>
     <Resource name="plan">
       <![CDATA[
 LogicalTableModify(table=[[CATALOG, SALES, EMPNULLABLES]], operation=[MERGE], updateColumnList=[[ENAME, DEPTNO, SAL]], flattened=[true])
-  LogicalProject(EMPNO=[$0], ENAME=[$1], $f2=[null:VARCHAR(10)], $f3=[null:INTEGER], $f4=[null:TIMESTAMP(0)], $f5=[CAST(*($5, 0.15:DECIMAL(2, 2))):INTEGER NOT NULL], $f6=[null:INTEGER], $f7=[10], $f8=[null:BOOLEAN], EMPNO0=[$9], ENAME0=[$10], JOB0=[$11], MGR0=[$12], HIREDATE0=[$13], SAL0=[$14], COMM0=[$15], DEPTNO0=[$16], SLACKER0=[$17], ENAME1=[$1], DEPTNO=[$7], $f20=[CAST(*($5, 0.1:DECIMAL(1, 1))):INTEGER NOT NULL])
+  LogicalProject(EMPNO=[$0], ENAME=[$1], $f2=[null:VARCHAR(10)], $f3=[null:INTEGER], $f4=[null:TIMESTAMP(0)], $f5=[*($5, 0.15:DECIMAL(2, 2))], $f6=[null:INTEGER], $f7=[10], $f8=[null:BOOLEAN], EMPNO0=[$9], ENAME0=[$10], JOB0=[$11], MGR0=[$12], HIREDATE0=[$13], SAL0=[$14], COMM0=[$15], DEPTNO0=[$16], SLACKER0=[$17], ENAME1=[$1], DEPTNO=[$7], $f20=[*($5, 0.1:DECIMAL(1, 1))])
     LogicalJoin(condition=[=($9, $0)], joinType=[left])
       LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5], COMM=[$6], DEPTNO=[$7], SLACKER=[$8])
         LogicalFilter(condition=[IS NULL($7)])
@@ -5883,6 +5975,17 @@ LogicalProject(D2=[$0], D3=[$1])
                     LogicalFilter(condition=[=($1, $0)])
                       LogicalProject(D4=[+($0, 4)], D5=[+($0, 5)], D6=[+($0, 6)])
                         LogicalTableScan(table=[[CATALOG, SALES, DEPT]])
+]]>
+    </Resource>
+  </TestCase>
+  <TestCase name="testNestedLambdaExpression">
+    <Resource name="sql">
+      <![CDATA[select "EXISTS"(array(1,2,3), x -> "EXISTS"(array(1,2,3), y -> x + y = 4))]]>
+    </Resource>
+    <Resource name="plan">
+      <![CDATA[
+LogicalProject(EXPR$0=[EXISTS(ARRAY(1, 2, 3), (X) -> EXISTS(ARRAY(1, 2, 3), (Y) -> =(+(X, Y), 4)))])
+  LogicalValues(tuples=[[{ 0 }]])
 ]]>
     </Resource>
   </TestCase>
@@ -7166,7 +7269,7 @@ LogicalTableModify(table=[[CATALOG, SALES, DEPT]], operation=[INSERT], flattened
   LogicalAggregate(group=[{0, 1}])
     LogicalProject(EMPNO=[$0], ENAME=[$1])
       LogicalFilter(condition=[$2])
-        LogicalProject(EMPNO=[$0], ENAME=[CAST($1):VARCHAR(10) NOT NULL], QualifyExpression=[=(RANK() OVER (PARTITION BY $1 ORDER BY $8 DESC), 1)])
+        LogicalProject(EMPNO=[$0], ENAME=[$1], QualifyExpression=[=(RANK() OVER (PARTITION BY $1 ORDER BY $8 DESC), 1)])
           LogicalFilter(condition=[>($7, 5)])
             LogicalTableScan(table=[[CATALOG, SALES, EMP]])
 ]]>
