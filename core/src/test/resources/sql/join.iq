@@ -188,6 +188,56 @@ order by "product_class"."product_family" asc nulls first,
 
 !ok
 
+# Tests plan and execution for a query with 4 tables, 3 joins
+select "time_by_day"."the_year" as "c0",
+  "time_by_day"."quarter" as "c1",
+  "product_class"."product_family" as "c2",
+  sum("sales_fact_1997"."unit_sales") as "m0"
+from "time_by_day" as "time_by_day",
+  "sales_fact_1997" as "sales_fact_1997",
+  "product_class" as "product_class",
+  "product" as "product"
+where "sales_fact_1997"."time_id" = "time_by_day"."time_id"
+  and "time_by_day"."the_year" = 1997
+  and "sales_fact_1997"."product_id" = "product"."product_id"
+  and "product"."product_class_id" = "product_class"."product_class_id"
+group by "time_by_day"."the_year", "time_by_day"."quarter", "product_class"."product_family"
+order by "c0", "c1", "c2";
++------+----+----------------+------------+
+| c0   | c1 | c2             | m0         |
++------+----+----------------+------------+
+| 1997 | Q1 | Drink          |  5976.0000 |
+| 1997 | Q1 | Food           | 47809.0000 |
+| 1997 | Q1 | Non-Consumable | 12506.0000 |
+| 1997 | Q2 | Drink          |  5895.0000 |
+| 1997 | Q2 | Food           | 44825.0000 |
+| 1997 | Q2 | Non-Consumable | 11890.0000 |
+| 1997 | Q3 | Drink          |  6065.0000 |
+| 1997 | Q3 | Food           | 47440.0000 |
+| 1997 | Q3 | Non-Consumable | 12343.0000 |
+| 1997 | Q4 | Drink          |  6661.0000 |
+| 1997 | Q4 | Food           | 51866.0000 |
+| 1997 | Q4 | Non-Consumable | 13497.0000 |
++------+----+----------------+------------+
+(12 rows)
+
+!ok
+EnumerableSort(sort0=[$0], sort1=[$1], sort2=[$2], dir0=[ASC], dir1=[ASC], dir2=[ASC])
+  EnumerableCalc(expr#0..2=[{inputs}], expr#3=[1997:SMALLINT], expr#4=[CAST($t3):SMALLINT], c0=[$t4], c1=[$t0], c2=[$t1], m0=[$t2])
+    EnumerableAggregate(group=[{2, 7}], m0=[$SUM0($5)])
+      EnumerableHashJoin(condition=[AND(=($3, $9), =($6, $8))], joinType=[semi])
+        EnumerableNestedLoopJoin(condition=[true], joinType=[inner])
+          EnumerableHashJoin(condition=[=($0, $4)], joinType=[inner])
+            EnumerableCalc(expr#0..9=[{inputs}], expr#10=[CAST($t4):INTEGER], expr#11=[1997], expr#12=[=($t10, $t11)], time_id=[$t0], the_year=[$t4], quarter=[$t8], $condition=[$t12])
+              EnumerableTableScan(table=[[foodmart2, time_by_day]])
+            EnumerableCalc(expr#0..7=[{inputs}], proj#0..1=[{exprs}], unit_sales=[$t7])
+              EnumerableTableScan(table=[[foodmart2, sales_fact_1997]])
+          EnumerableCalc(expr#0..4=[{inputs}], product_class_id=[$t0], product_family=[$t4])
+            EnumerableTableScan(table=[[foodmart2, product_class]])
+        EnumerableCalc(expr#0..14=[{inputs}], proj#0..1=[{exprs}])
+          EnumerableTableScan(table=[[foodmart2, product]])
+!plan
+
 !use scott
 
 # [CALCITE-35] Support parenthesized sub-clause in JOIN
